@@ -25,3 +25,6 @@ x64/
 
 # VS local settings
 .vs/
+
+# Output images
+.ppm
