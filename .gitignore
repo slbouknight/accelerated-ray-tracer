@@ -1,41 +1,27 @@
-# Prerequisites
-*.d
+# Directories
+bin/
+build/
+out/
+.vs/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
+# Visual Studio build artifacts
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.user
+*.filters
+
+# Build output directories
+x64/
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
 *.pdb
+*.ipch
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+*.cache
+*.db
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
+# VS local settings
+.vs/
