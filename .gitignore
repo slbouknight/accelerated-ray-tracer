@@ -23,10 +23,6 @@ x64/
 *.sdf
 *.cache
 *.db
-*.ppm
 
 # VS local settings
 .vs/
-
-# Output images
-
