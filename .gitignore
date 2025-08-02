@@ -10,6 +10,7 @@ out/
 *.vcxproj.*
 *.user
 *.filters
+*.vscode
 
 # Build output directories
 x64/
@@ -22,9 +23,10 @@ x64/
 *.sdf
 *.cache
 *.db
+*.ppm
 
 # VS local settings
 .vs/
 
 # Output images
-.ppm
+
