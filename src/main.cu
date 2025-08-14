@@ -90,7 +90,7 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
     fb[pixel_index] = col;
 }
 
-__global__ void create_world(hittable **d_list, hittable **d_world, camera **d_camera) 
+__global__ void create_world(hittable **d_list, hittable **d_world, camera **d_camera, int nx, int ny) 
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) 
     {
@@ -105,7 +105,11 @@ __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_c
         d_list[4] = new sphere(vec3(-1,0,-1), -0.45,
                                  new dielectric(1.5));
         *d_world = new hittable_list(d_list,5);
-        *d_camera = new camera();
+        *d_camera   = new camera(vec3(-2,2,1),
+                                 vec3(0,0,-1),
+                                 vec3(0,1,0),
+                                 20.0,
+                                 float(nx)/float(ny));
     }
 }
 
@@ -148,7 +152,7 @@ int main()
     checkCudaErrors(cudaMalloc((void **)&d_list, 4*sizeof(hittable *)));
     hittable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-    create_world<<<1,1>>>(d_list,d_world, d_camera);
+    create_world<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
