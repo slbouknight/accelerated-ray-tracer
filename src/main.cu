@@ -1,7 +1,7 @@
+#include <curand_kernel.h>
+#include <float.h>
 #include <iostream>
 #include <time.h>
-#include <float.h>
-#include <curand_kernel.h>
 
 #include "camera.h"
 #include "hittable_list.h"
@@ -92,16 +92,19 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
 
 __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_camera) 
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) 
+    {
         d_list[0] = new sphere(vec3(0,0,-1), 0.5,
-                               new lambertian(vec3(0.8, 0.3, 0.3)));
+                                new lambertian(vec3(0.1, 0.2, 0.5)));
         d_list[1] = new sphere(vec3(0,-100.5,-1), 100,
-                               new lambertian(vec3(0.8, 0.8, 0.0)));
+                                new lambertian(vec3(0.8, 0.8, 0.0)));
         d_list[2] = new sphere(vec3(1,0,-1), 0.5,
-                               new metal(vec3(0.8, 0.6, 0.2), 1.0));
+                                new metal(vec3(0.8, 0.6, 0.2), 0.0));
         d_list[3] = new sphere(vec3(-1,0,-1), 0.5,
-                               new metal(vec3(0.8, 0.8, 0.8), 0.3));
-        *d_world  = new hittable_list(d_list,4);
+                                 new dielectric(1.5));
+        d_list[4] = new sphere(vec3(-1,0,-1), -0.45,
+                                 new dielectric(1.5));
+        *d_world = new hittable_list(d_list,5);
         *d_camera = new camera();
     }
 }
