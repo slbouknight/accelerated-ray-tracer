@@ -79,7 +79,7 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
     {
         float u = float( i + curand_uniform(&local_rand_state)) / float(max_x);
         float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
-        ray r = (*cam)->get_ray(u, v);
+        ray r = (*cam)->get_ray(u, v, &local_rand_state);
         col += color(r, world, &local_rand_state);
     }
     rand_state[pixel_index] = local_rand_state;
@@ -92,8 +92,7 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
 
 __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_camera, int nx, int ny) 
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) 
-    {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
         d_list[0] = new sphere(vec3(0,0,-1), 0.5,
                                 new lambertian(vec3(0.1, 0.2, 0.5)));
         d_list[1] = new sphere(vec3(0,-100.5,-1), 100,
@@ -105,17 +104,24 @@ __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_c
         d_list[4] = new sphere(vec3(-1,0,-1), -0.45,
                                  new dielectric(1.5));
         *d_world = new hittable_list(d_list,5);
-        *d_camera   = new camera(vec3(-2,2,1),
-                                 vec3(0,0,-1),
+        vec3 lookfrom(3,3,2);
+        vec3 lookat(0,0,-1);
+        float dist_to_focus = (lookfrom-lookat).length();
+        float aperture = 2.0;
+        *d_camera   = new camera(lookfrom,
+                                 lookat,
                                  vec3(0,1,0),
                                  20.0,
-                                 float(nx)/float(ny));
+                                 float(nx)/float(ny),
+                                 aperture,
+                                 dist_to_focus);
     }
 }
 
 __global__ void free_world(hittable **d_list, hittable **d_world, camera **d_camera) 
 {
-    for(int i=0; i < 4; i++) {
+    for(int i=0; i < 5; i++) 
+    {
         delete ((sphere *)d_list[i])->mat_ptr;
         delete d_list[i];
     }
