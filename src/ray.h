@@ -1,26 +1,19 @@
-#ifndef RAY_H
-#define RAY_H
-
-#include "rtweekend.h"
+#ifndef RAYH
+#define RAYH
+#include "vec3.h"
 
 class ray
 {
     public:
-        ray() {}
+        __device__ ray() {}
+        __device__ ray(const vec3& a, const vec3& b) { A=a; B=b;}
+        __device__ vec3 origin() const { return A; }
+        __device__ vec3 direction() const { return B;}
+        __device__ vec3 point_at_parameter(float t) const { return A + t*B; } 
 
-        ray(const point3& origin, const vec3& direction) : orig(origin), dir(direction) {}
+        vec3 A;
+        vec3 B;
 
-        const point3& origin() const { return orig; }
-        const vec3& direction() const { return dir; }
-
-        point3 at(double t) const
-        {
-            return orig + t*dir;
-        }
-
-    private:
-        point3 orig;
-        vec3 dir;
 };
 
 #endif
