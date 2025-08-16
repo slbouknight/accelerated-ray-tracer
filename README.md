@@ -11,7 +11,6 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 ## Table of Contents
 - [Features](#features)
 - [Requirements](#requirements)
-- [Project Structure](#project-structure)
 - [Build & Run](#build--run)
   - [Quick start (Windows)](#quick-start-windows)
   - [Manual CMake build](#manual-cmake-build)
@@ -25,18 +24,32 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 ## Features
 
 ### Rendering pipeline
-- **Antialiasing via stochastic supersampling** (per-pixel jitter using cuRAND)
-- **Gamma correction**
+- **Antialiasing via stochastic supersampling** (per-pixel jitter using cuRAND)  
+  <p align="left">
+    <img src="images/anti-aliasing.png" alt="Anti-aliasing" width="600"/>
+  </p>
+
+- **Gamma correction** with configurable values
+  <p align="left">
+    <img src="images/gamma-correction.png" alt="Gamma correction" width="600"/>
+  </p>
+
 
 ### Materials
-- **Lambertian** (diffuse) with random cosine-ish scattering
-- **Metal** with **fuzz** parameter for rough/microfacet reflections
-- **Dielectric** (glass): **refraction**, **total internal reflection**, and **Schlick** reflectance
-![Dielectric](images/materials.png)
+- **Metal** with **fuzz** parameter for rough/microfacet reflections  
+- **Lambertian** (diffuse) with random cosine-ish scattering  
+- **Dielectric** (glass): **refraction**, **total internal reflection**, and **Schlick** reflectance  
+  <p align="left">
+    <img src="images/materials.png" alt="Gamma correction" width="600"/>
+  </p>
+
 
 ### Camera
 - **Thin‑lens defocus blur (depth of field)** (aperture + focus distance)
 - Proper **camera basis** (`u/v/w`) with configurable FOV and aspect ratio
+  <p align="left">
+      <img src="images/defocus.png" alt="Gamma correction" width="600"/>
+  </p>
 
 ---
 
@@ -48,22 +61,6 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 - NVIDIA GPU with supported **compute capability** (current flags target Ada 8.9; adjust for your GPU)
 
 > If you target a different architecture, set `CMAKE_CUDA_ARCHITECTURES` (or `-gencode` in NVCC flags) appropriately in `CMakeLists.txt`.
-
----
-
-## Project Structure
-
-```
-accelerated-ray-tracer/
-├── CMakeLists.txt
-├── src/
-│   └── main.cu
-├── include/            # headers (camera.h, ray.h, material.h, sphere.h, vec3.h, hittable_list.h, ...)
-├── setup.bat           # clean, configure, build, run – prompts for output filename
-├── README.md
-└── images/             # sample images
-    └── ...
-```
 
 ---
 
