@@ -8,19 +8,6 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 
 ---
 
-## Table of Contents
-- [Features](#features)
-- [Requirements](#requirements)
-- [Build & Run](#build--run)
-  - [Quick start (Windows)](#quick-start-windows)
-  - [Manual CMake build](#manual-cmake-build)
-  - [Running & output](#running--output)
-- [How it works (GPU notes)](#how-it-works-gpu-notes)
-- [Tuning](#tuning)
-- [Acknowledgements](#acknowledgements)
-
----
-
 ## Features
 
 ### Rendering pipeline
@@ -40,7 +27,7 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 - **Lambertian** (diffuse) with random cosine-ish scattering  
 - **Dielectric** (glass): **refraction**, **total internal reflection**, and **Schlick** reflectance  
   <p align="left">
-    <img src="images/materials.png" alt="Gamma correction" width="600"/>
+    <img src="images/materials.png" alt="Materials" width="600"/>
   </p>
 
 
@@ -48,8 +35,17 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
 - **Thin‑lens defocus blur (depth of field)** (aperture + focus distance)
 - Proper **camera basis** (`u/v/w`) with configurable FOV and aspect ratio
   <p align="left">
-      <img src="images/defocus.png" alt="Gamma correction" width="600"/>
+      <img src="images/defocus.png" alt="Depth of Field" width="600"/>
   </p>
+
+### Motion Blur
+- **Shutter interval sampling**: each ray carries a randomized time in `[time0, time1]`
+- **Animated primitives**: object positions are interpolated across the shutter window
+- Produces natural blur trails when geometry moves during exposure
+  <p align="left">
+      <img src="images/motion-blur.png" alt="Motion blur" width="600"/>
+  </p>
+
 
 ---
 
