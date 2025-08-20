@@ -122,8 +122,7 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, float gamma, came
 __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_camera,
                              int nx, int ny, curandState *rand_state)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) 
-    {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
         int i = 0;
 
@@ -135,49 +134,47 @@ __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_c
         for (int a = GRID_MIN; a < GRID_MAX; a++) {
             for (int b = GRID_MIN; b < GRID_MAX; b++) {
                 float choose_mat = RND;
-                vec3 center(a + RND, 0.2f, b + RND);
+                vec3 center(a + 0.9f * RND, 0.2f, b + 0.9f * RND); // 0.9 like the book
 
-                if (choose_mat < 0.8f) 
-                {
-                    // Diffuse
-                    d_list[i++] = new sphere(center, 0.2f,
-                        new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
-                } else if (choose_mat < 0.95f) 
-                {
-                    // Metal with fuzz
-                    d_list[i++] = new sphere(center, 0.2f,
-                        new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)),
-                                  0.5f*RND));
-                } else 
-                {
-                    // Dielectric
+                if (choose_mat < 0.8f) {
+                    // Diffuse — MOVING
+                    vec3 albedo(RND*RND, RND*RND, RND*RND);
+
+                    // random velocity in each axis
+                    vec3 vel(0.0f, 0.5f*RND, 0.25f*(RND - 0.5f));
+                    vec3 center2 = center + vel;
+                    d_list[i++] = new sphere(center, center2, 0.2f, new lambertian(albedo));
+                } else if (choose_mat < 0.95f) {
+                    // Metal with fuzz (static)
+                    vec3 albedo(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND));
+                    float fuzz = 0.5f * RND;
+                    d_list[i++] = new sphere(center, 0.2f, new metal(albedo, fuzz));
+                } else {
+                    // Dielectric (static)
                     d_list[i++] = new sphere(center, 0.2f, new dielectric(1.5f));
                 }
             }
         }
 
-        // Three big spheres
+        // Three big spheres (static)
         d_list[i++] = new sphere(vec3( 0.0f, 1.0f,  0.0f), 1.0f, new dielectric(1.5f));
         d_list[i++] = new sphere(vec3(-4.0f, 1.0f,  0.0f), 1.0f, new lambertian(vec3(0.4f, 0.2f, 0.1f)));
         d_list[i++] = new sphere(vec3( 4.0f, 1.0f,  0.0f), 1.0f, new metal(vec3(0.7f, 0.6f, 0.5f), 0.0f));
 
         *rand_state = local_rand_state;
-        *d_world = new hittable_list(d_list, NUM_OBJECTS);
+        *d_world = new hittable_list(d_list, i); // exact count since no skips
 
-        // Camera (same composition)
+        // Camera — add shutter times [0,1]
         vec3 lookfrom(13.0f, 2.0f, 3.0f);
         vec3 lookat (0.0f,  0.0f, 0.0f);
         vec3 vup(0.0f, 1.0f, 0.0f);
-        float dist_to_focus = (lookfrom - lookat).length();  // fixed
+        float dist_to_focus = (lookfrom - lookat).length();
         float aperture = 0.1f;
 
-        *d_camera = new camera(lookfrom,
-                               lookat,
-                               vup,
-                               30.0f,
-                               float(nx)/float(ny),
-                               aperture,
-                               dist_to_focus);
+        *d_camera = new camera(lookfrom, lookat, vup,
+                               30.0f, float(nx)/float(ny),
+                               aperture, dist_to_focus,
+                               /*time0=*/0.0, /*time1=*/1.0);
     }
 }
 
