@@ -127,9 +127,14 @@ __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_c
         curandState local_rand_state = *rand_state;
         int i = 0;
 
-        // Ground
+        // Ground (checkered)
+        texture* checker = new checker_texture(0.32f,
+            new solid_color(vec3(0.2f, 0.3f, 0.1f)),
+            new solid_color(vec3(0.9f, 0.9f, 0.9f)));
+
         d_list[i++] = new sphere(vec3(0.0f, -1000.0f, -1.0f), 1000.0f,
-                                 new lambertian(vec3(0.5f, 0.5f, 0.5f)));
+                                new lambertian(checker));
+
 
         // Random small spheres on a grid
         for (int a = GRID_MIN; a < GRID_MAX; a++) {
