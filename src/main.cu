@@ -11,6 +11,7 @@
 #include "hittable_list.cuh"
 #include "image_io.h"
 #include "material.cuh"
+#include "perlin.cuh"
 #include "ray.cuh"
 #include "sphere.cuh"
 #include "texture.cuh"
@@ -251,6 +252,27 @@ __global__ void create_world_earth(hittable **d_list, hittable **d_world, camera
     }
 }
 
+__global__ void create_world_perlin(hittable **d_list, hittable **d_world, camera **d_camera,
+                                    int nx, int ny, float scale)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int i = 0;
+
+        texture* pertext = new noise_texture(scale);
+        material* lam    = new lambertian(pertext);
+
+        d_list[i++] = new sphere(vec3(0,-1000,0), 1000.f, lam);
+        d_list[i++] = new sphere(vec3(0,     2,0),    2.f, lam);
+
+        *d_world = new bvh_node(d_list, 0, i);
+
+        vec3 lookfrom(13,2,3), lookat(0,0,0), vup(0,1,0);
+        *d_camera = new camera(lookfrom, lookat, vup,
+                               20.0f, float(nx)/float(ny),
+                               0.0f, 10.0f, 0.0, 1.0);
+    }
+}
+
 __global__ void free_world(hittable **d_list, hittable **d_world, camera **d_camera, int num_objects)
 {
     for (int i = 0; i < num_objects; i++) {
@@ -477,11 +499,64 @@ int earth() {
     return 0;
 }
 
+int perlin() {
+    int nx = 1200, ny = 600, ns = 500;
+    float gamma = 2.2f;
+    int tx = 8, ty = 8;
+
+    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
+
+    int num_pixels = nx * ny;
+    size_t fb_size = num_pixels * sizeof(vec3);
+
+    vec3 *fb;                      checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
+    curandState *d_rand_state;     checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
+    curandState *d_rand_state2;    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+
+    camera **d_camera;             checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+    int num_hitables = 2;          // ground + sphere
+    hittable **d_list;             checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables * sizeof(hittable *)));
+    hittable **d_world;            checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
+
+    const float scale = 4.0f;      // tweak to taste (like the book)
+    create_world_perlin<<<1,1>>>(d_list, d_world, d_camera, nx, ny, scale);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
+    checkCudaErrors(cudaDeviceSynchronize());
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
+        size_t k = j*nx + i;
+        int ir = int(255.99f*fb[k].r());
+        int ig = int(255.99f*fb[k].g());
+        int ib = int(255.99f*fb[k].b());
+        std::cout << ir << " " << ig << " " << ib << "\n";
+    }
+
+    free_world<<<1,1>>>(d_list, d_world, d_camera, /*num_objects=*/num_hitables);
+    checkCudaErrors(cudaDeviceSynchronize());
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_rand_state));
+    checkCudaErrors(cudaFree(fb));
+    cudaDeviceReset();
+    return 0;
+}
+
 int main() {
-    switch (3) 
+    switch (4) 
     {                  // 1 = bouncing, 2 = checkered, 3 = earth
         case 1: bouncing_spheres();
         case 2: checkered_spheres();
         case 3: earth();
+        case 4: perlin();
     }
 }
