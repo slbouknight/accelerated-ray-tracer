@@ -5,6 +5,7 @@
 #include <math_constants.h>
 #include <time.h>
 
+#include "bvh.h"
 #include "camera.h"
 #include "hittable_list.h"
 #include "material.h"
@@ -162,7 +163,7 @@ __global__ void create_world(hittable **d_list, hittable **d_world, camera **d_c
         d_list[i++] = new sphere(vec3( 4.0f, 1.0f,  0.0f), 1.0f, new metal(vec3(0.7f, 0.6f, 0.5f), 0.0f));
 
         *rand_state = local_rand_state;
-        *d_world = new hittable_list(d_list, i); // exact count since no skips
+        *d_world = new bvh_node(d_list, 0, i);
 
         // Camera — add shutter times [0,1]
         vec3 lookfrom(13.0f, 2.0f, 3.0f);
@@ -196,6 +197,11 @@ int main()
     float gamma = 2.2f;
     int tx = 8;
     int ty = 8;
+
+    // Increase per thread call stack size and device heap
+    // Temporary workaround since bvh is still recursive 
+    cudaDeviceSetLimit(cudaLimitStackSize,      16384);        // 16 KB
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024); // 64 MB device heap
 
     std::cerr << "Rendering a " << nx << "x" << ny << " image ";
     std::cerr << "in " << tx << "x" << ty << " blocks.\n";
