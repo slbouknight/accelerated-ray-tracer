@@ -1,9 +1,9 @@
-#ifndef BVHH
-#define BVHH
+#ifndef BVH_CUH
+#define BVH_CUH
 
 #include <curand_kernel.h>   // only if you want RNG for axis choice (optional)
-#include "hittable.h"
-#include "aabb.h"
+#include "hittable.cuh"
+#include "aabb.cuh"
 
 // ----- helpers: box comparisons & tiny in-place sort over [start,end) -----
 

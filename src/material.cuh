@@ -1,10 +1,10 @@
-#ifndef MATERIALH
-#define MATERIALH
+#ifndef MATERIAL_CUH
+#define MATERIAL_CUH
 
 struct hit_record;
 
-#include "ray.h"
-#include "hittable.h"
+#include "ray.cuh"
+#include "hittable.cuh"
 #include <curand_kernel.h>
 
 __device__ float schlick(float cosine, float ref_idx)

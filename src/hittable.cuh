@@ -1,8 +1,8 @@
-#ifndef HITTABLEH
-#define HITTABLEH
+#ifndef HITTABLE_CUH
+#define HITTABLE_CUH
 
-#include "aabb.h"
-#include "ray.h"
+#include "aabb.cuh"
+#include "ray.cuh"
 
 class material;
 

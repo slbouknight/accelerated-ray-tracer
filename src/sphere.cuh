@@ -1,8 +1,8 @@
-#ifndef SPHEREH
-#define SPHEREH
+#ifndef SPHERE_CUH
+#define SPHERE_CUH
 
-#include "hittable.h"
-#include "material.h"
+#include "hittable.cuh"
+#include "material.cuh"
 #include <math.h>
 
 class sphere : public hittable {

@@ -1,9 +1,9 @@
-#ifndef CAMERAH
-#define CAMERAH
+#ifndef CAMERA_CUH
+#define CAMERA_CUH
 
 #include <math_constants.h>
 #include <curand_kernel.h>
-#include "ray.h"
+#include "ray.cuh"
 
 __device__ inline vec3 random_in_unit_disk(curandState *local_rand_state) {
     vec3 p;

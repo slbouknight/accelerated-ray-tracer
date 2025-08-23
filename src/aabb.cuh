@@ -1,9 +1,9 @@
-#ifndef AABB_H
-#define AABB_H
+#ifndef AABB_CUH
+#define AABB_CUH
 
 #include <float.h>
-#include "vec3.h"
-#include "ray.h"
+#include "vec3.cuh"
+#include "ray.cuh"
 
 class aabb
 {

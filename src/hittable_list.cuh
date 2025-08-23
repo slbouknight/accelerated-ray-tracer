@@ -1,8 +1,8 @@
-#ifndef HITTABLELISTH
-#define HITTABLELISTH
+#ifndef HITTABLELIST_CUH
+#define HITTABLELIST_CUH
 
-#include "hittable.h"
-#include "aabb.h"
+#include "hittable.cuh"
+#include "aabb.cuh"
 
 class hittable_list : public hittable 
 {

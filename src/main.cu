@@ -5,13 +5,13 @@
 #include <math_constants.h>
 #include <time.h>
 
-#include "bvh.h"
-#include "camera.h"
-#include "hittable_list.h"
-#include "material.h"
-#include "ray.h"
-#include "sphere.h"
-#include "vec3.h"
+#include "bvh.cuh"
+#include "camera.cuh"
+#include "hittable_list.cuh"
+#include "material.cuh"
+#include "ray.cuh"
+#include "sphere.cuh"
+#include "vec3.cuh"
 
 #define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line)
