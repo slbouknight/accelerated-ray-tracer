@@ -14,7 +14,7 @@ target_compile_options(rayTracer PRIVATE
 
 # Copy textures
 # Also copy to the build root (where you run the exe from)
-configure_file(${CMAKE_SOURCE_DIR}/images/earthmap.jpg
+configure_file(${CMAKE_SOURCE_DIR}/textures/earthmap.jpg
                ${CMAKE_BINARY_DIR}/earthmap.jpg COPYONLY)
 
 

@@ -415,7 +415,7 @@ int earth() {
 
     // Load earth texture on HOST, upload to device
     unsigned char* d_pixels = nullptr;
-    DeviceImage earth_img   = load_image_to_device("images/earthmap.jpg", &d_pixels);
+    DeviceImage earth_img   = load_image_to_device("textures/earthmap.jpg", &d_pixels);
     if (!earth_img.valid()) {
         std::cerr << "Failed to load earthmap.jpg\n";
         return 1;
@@ -478,7 +478,7 @@ int earth() {
 }
 
 int main() {
-    switch (1) 
+    switch (3) 
     {                  // 1 = bouncing, 2 = checkered, 3 = earth
         case 1: bouncing_spheres();
         case 2: checkered_spheres();
