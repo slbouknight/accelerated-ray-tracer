@@ -13,8 +13,8 @@ class sphere : public hittable
         __device__ sphere() {}
 
         // Static sphere -> zero velocity
-        __device__ sphere(vec3 cen, float r, material* m)
-            : center(ray(cen, vec3(0,0,0), 0.0)), radius(r), mat_ptr(m)
+        __device__ sphere(vec3 cen, float r, material* m, bool owns=true)
+            : center(ray(cen, vec3(0,0,0), 0.0)), radius(r), mat_ptr(m), owns_mat(owns)
         {
             vec3 rvec(radius, radius, radius);
             bbox = aabb(cen - rvec, cen + rvec);
@@ -83,11 +83,16 @@ class sphere : public hittable
             return false;
         }
 
+        __device__ ~sphere() override { if (owns_mat && mat_ptr) delete mat_ptr; }
+
+        __device__ HKind kind() const override { return HK_Sphere; }
+
         // members (POD style)
         ray center;          // encodes c(t) = c0 + t*(c1-c0), t in [0,1]
         float radius;
         material* mat_ptr;
         aabb bbox;
+        bool owns_mat;
 
 };
 

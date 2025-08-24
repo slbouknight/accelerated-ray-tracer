@@ -39,36 +39,49 @@ __device__ inline float apply_gamma(float c, float gamma)
     return powf(fmaxf(c, 0.0f), inv);
 }
 
-__device__ vec3 color(const ray& r, hittable **world, curandState *local_rand_state)
+__device__ vec3 color(const ray& r0,
+                      const vec3& background,
+                      bool gradient_bg,
+                      hittable **world,
+                      curandState *local_rand_state)
 {
-    ray cur_ray = r;
-    vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
-    for(int i = 0; i < 50; i++)
+    ray  cur_ray        = r0;
+    vec3 throughput     = vec3(1,1,1);
+    vec3 radiance       = vec3(0,0,0);
+
+    for (int bounce = 0; bounce < 50; ++bounce) 
     {
         hit_record rec;
-        if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec))
-        {
-            ray scattered;
-            vec3 attenuation;
-            if (rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state))
+        if (!(*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+            // miss: add background
+            vec3 bg = background;
+            if (gradient_bg) 
             {
-                cur_attenuation *= attenuation;
-                cur_ray = scattered;
+                vec3 unit_direction = unit_vector(cur_ray.direction());
+                float t = 0.5f*(unit_direction.y() + 1.0f);
+                bg = (1.0f - t)*vec3(1.0, 1.0, 1.0) + t*vec3(0.5, 0.7, 1.0);
             }
-            else
-            {
-                return vec3(0.0, 0.0, 0.0);
-            }
+            radiance += throughput * bg;
+            break;
         }
-        else
+
+        // add emission at this hit
+        radiance += throughput * rec.mat_ptr->emitted(rec.u, rec.v, rec.p);
+
+        // scatter
+        ray  scattered;
+        vec3 attenuation;
+        if (!rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state)) 
         {
-            vec3 unit_direction = unit_vector(cur_ray.direction());
-            float t = 0.5f*(unit_direction.y() + 1.0f);
-            vec3 c = (1.0f-t)*vec3(1.0, 1.0, 1.0) + t*vec3(0.5, 0.7, 1.0);
-            return cur_attenuation * c;
+            // light or absorbing surface: we’re done
+            break;
         }
+
+        throughput *= attenuation;
+        cur_ray = scattered;
     }
-    return vec3(0.0, 0.0, 0.0);
+
+    return radiance;
 }
 
 __global__ void rand_init(curandState *rand_state) 
@@ -89,22 +102,27 @@ __global__ void render_init(int max_x, int max_y, curandState *rand_state)
     curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, int ns, float gamma, camera **cam, hittable **world, curandState *rand_state)
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns, float gamma,
+                       camera **cam, hittable **world, curandState *rand_state,
+                       vec3 background, int use_gradient_bg)
 {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
-    if((i >= max_x) || (j >= max_y)) return;
+    if ((i >= max_x) || (j >= max_y)) return;
+
     int pixel_index = j*max_x + i;
     curandState local_rand_state = rand_state[pixel_index];
-    vec3 col(0, 0, 0);
-    for(int s=0; s < ns; s++)
+
+    vec3 col(0,0,0);
+    for (int s = 0; s < ns; s++) 
     {
-        float u = float( i + curand_uniform(&local_rand_state)) / float(max_x);
+        float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
         float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
         ray r = (*cam)->get_ray(u, v, &local_rand_state);
-        col += color(r, world, &local_rand_state);
+        col += color(r, background, use_gradient_bg != 0, world, &local_rand_state);
     }
     rand_state[pixel_index] = local_rand_state;
+
     col /= float(ns);
     col[0] = apply_gamma(col[0], gamma);
     col[1] = apply_gamma(col[1], gamma);
@@ -303,24 +321,84 @@ __global__ void create_world_quads(hittable **d_list, hittable **d_world, camera
     }
 }
 
-__global__ void free_world(hittable **d_list, hittable **d_world, camera **d_camera, int num_objects)
+__global__ void create_world_simple_light(hittable **d_list, hittable **d_world, camera **d_camera,
+                                          int nx, int ny)
 {
-    for (int i = 0; i < num_objects; i++) {
-        delete ((sphere*)d_list[i])->mat_ptr;
-        delete d_list[i];
-    }
-    delete *d_world;
-    delete *d_camera;
+    if (threadIdx.x || blockIdx.x) return;
+    int i = 0;
+
+    // --- Perlin (book uses scale=4) ---
+    texture* pertex = new noise_texture(4.0f);          // requires noise_texture in texture.cuh/perlin.cuh
+    material* perlam = new lambertian(pertex);          // lambertian(texture*) ctor takes ownership
+
+    // Ground + floating sphere use Perlin
+    d_list[i++] = new sphere(vec3(0,-1000,0), 1000.f, perlam);
+    d_list[i++] = new sphere(vec3(0,2,0),        2.f, new lambertian(new noise_texture(4.0f)));
+
+    // Lights (don’t share one instance unless one of the leaves passes owns=false)
+    material* light1 = new diffuse_light(vec3(4,4,4));
+    material* light2 = new diffuse_light(vec3(4,4,4));
+    d_list[i++] = new sphere(vec3(0,7,0), 2.f,  light1);
+    d_list[i++] = new quad  (vec3(3,1,-2), vec3(2,0,0), vec3(0,2,0), light2);
+
+    *d_world = new bvh_node(d_list, 0, i);
+
+    // Camera (same as your current one)
+    vec3 lookfrom(26,3,6), lookat(0,2,0), vup(0,1,0);
+    float dist_to_focus = (lookfrom - lookat).length();
+    *d_camera = new camera(lookfrom, lookat, vup,
+                           20.0f, float(nx)/float(ny),
+                           0.0f, dist_to_focus,
+                           0.0, 1.0);
 }
 
-__global__ void free_world_quads(hittable **d_list, hittable **d_world, camera **d_camera, int num_objects)
+__global__ void create_world_cornell(hittable **d_list, hittable **d_world, camera **d_camera,
+                                     int nx, int ny)
 {
-    for (int i = 0; i < num_objects; ++i) {
-        delete ((quad*)d_list[i])->mat_ptr;
-        delete d_list[i];
+    if (threadIdx.x || blockIdx.x) return;
+    int i = 0;
+    material* red    = new lambertian(vec3(.65f,.05f,.05f));          // unique
+    material* green  = new lambertian(vec3(.12f,.45f,.15f));          // unique
+    material* white1 = new lambertian(vec3(.73f,.73f,.73f));          // floor
+    material* white2 = new lambertian(vec3(.73f,.73f,.73f));          // ceiling
+    material* white3 = new lambertian(vec3(.73f,.73f,.73f));          // back
+    material* light  = new diffuse_light(vec3(15.f,15.f,15.f));       // unique
+
+    // quads with inward normals
+    d_list[i++] = new quad(vec3(0,0,0),       vec3(0,555,0),  vec3(0,0,555),  green,  true);
+    d_list[i++] = new quad(vec3(555,0,555),   vec3(0,555,0),  vec3(0,0,-555), red,    true);
+    d_list[i++] = new quad(vec3(0,0,0),       vec3(555,0,0),  vec3(0,0,555),  white1, true);
+    d_list[i++] = new quad(vec3(0,555,555),   vec3(555,0,0),  vec3(0,0,-555), white2, true);
+    d_list[i++] = new quad(vec3(555,0,555),   vec3(-555,0,0), vec3(0,555,0),  white3, true);
+    d_list[i++] = new quad(vec3(213,554,227), vec3(130,0,0),  vec3(0,0,105),  light,  true);
+
+
+    *d_world = new bvh_node(d_list, 0, i);
+
+    // Camera
+    vec3 lookfrom(278,278,-800), lookat(278,278,0), vup(0,1,0);
+    float dist_to_focus = (lookfrom - lookat).length();
+    *d_camera = new camera(lookfrom, lookat, vup,
+                           40.0f, float(nx)/float(ny),
+                           0.0f, dist_to_focus,
+                           0.0, 1.0);
+}
+
+__global__ void free_world(hittable **d_list, int count,
+                           hittable **d_world,
+                           camera   **d_camera)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // 1) Delete all leaves (their virtual dtors free owned materials)
+        for (int i = 0; i < count; ++i)
+            delete d_list[i];
+
+        // 2) Delete BVH internal nodes (dtor skips leaves by design)
+        delete *d_world;
+
+        // 3) Delete camera
+        delete *d_camera;
     }
-    delete *d_world;
-    delete *d_camera;
 }
 
 void bouncing_spheres()
@@ -376,7 +454,7 @@ void bouncing_spheres()
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny,  ns, gamma, d_camera, d_world, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny,  ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     stop = clock();
@@ -399,9 +477,12 @@ void bouncing_spheres()
     }
     
     // Clean up
-    checkCudaErrors(cudaDeviceSynchronize());
-    free_world<<<1,1>>>(d_list,d_world,d_camera, num_hitables);
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
     checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
@@ -440,7 +521,7 @@ int checkered_spheres() {
     dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
     checkCudaErrors(cudaDeviceSynchronize());
 
     std::cout << "P3\n" << nx << " " << ny << "\n255\n";
@@ -452,8 +533,13 @@ int checkered_spheres() {
         std::cout << ir << " " << ig << " " << ib << "\n";
     }
 
-    free_world<<<1,1>>>(d_list, d_world, d_camera, /*num_objects=*/num_hitables);
-    checkCudaErrors(cudaDeviceSynchronize());
+    // --- Clean up ---
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
@@ -508,7 +594,7 @@ int earth() {
     dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
     checkCudaErrors(cudaDeviceSynchronize());
 
     // Output PPM
@@ -524,8 +610,12 @@ int earth() {
     }
 
     // Cleanup
-    free_world<<<1,1>>>(d_list, d_world, d_camera, /*num_objects=*/num_hitables);
-    checkCudaErrors(cudaDeviceSynchronize());
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
@@ -568,7 +658,7 @@ int perlin() {
     dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
     checkCudaErrors(cudaDeviceSynchronize());
 
     std::cout << "P3\n" << nx << " " << ny << "\n255\n";
@@ -580,8 +670,13 @@ int perlin() {
         std::cout << ir << " " << ig << " " << ib << "\n";
     }
 
-    free_world<<<1,1>>>(d_list, d_world, d_camera, /*num_objects=*/num_hitables);
-    checkCudaErrors(cudaDeviceSynchronize());
+    // --- Clean up ---
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
@@ -592,7 +687,7 @@ int perlin() {
 }
 
 int quads_scene() {
-    int nx = 400, ny = 400, ns = 100;
+    int nx = 1200, ny = 600, ns = 500;
     float gamma = 2.2f;
     int tx = 8, ty = 8;
 
@@ -619,7 +714,7 @@ int quads_scene() {
     dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
     checkCudaErrors(cudaDeviceSynchronize());
 
     std::cout << "P3\n" << nx << " " << ny << "\n255\n";
@@ -631,8 +726,139 @@ int quads_scene() {
         std::cout << ir << " " << ig << " " << ib << "\n";
     }
 
-    free_world_quads<<<1,1>>>(d_list, d_world, d_camera, num_hitables);
+    // --- Clean up ---
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_rand_state));
+    checkCudaErrors(cudaFree(fb));
+    cudaDeviceReset();
+    return 0;
+}
+
+int simple_light() 
+{
+    // image / render params
+    int nx = 1200;
+    int ny = 600;
+    int ns = 500;
+    float gamma = 2.2f;
+    int tx = 8, ty = 8;
+
+    // device limits (same as your other scenes)
+    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
+
+    // frame buffer
+    int num_pixels = nx * ny;
+    size_t fb_size = num_pixels * sizeof(vec3);
+    vec3 *fb; checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+
+    // RNG
+    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void**)&d_rand_state,  num_pixels*sizeof(curandState)));
+    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void**)&d_rand_state2, sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+
+    // scene storage
+    camera   **d_camera; checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
+    const int num_hitables = 4; // ground + gray sphere + light sphere + light quad
+    hittable **d_list;   checkCudaErrors(cudaMalloc((void**)&d_list,   num_hitables * sizeof(hittable*)));
+    hittable **d_world;  checkCudaErrors(cudaMalloc((void**)&d_world,  sizeof(hittable*)));
+
+    // build the scene on device
+    create_world_simple_light<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
+    checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
+
+    // render
+    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);              checkCudaErrors(cudaDeviceSynchronize());
+    render     <<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state,
+                                     /*background*/ vec3(0,0,0), /*use_gradient_bg*/ 0);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // output PPM
+    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    for (int j = ny-1; j >= 0; --j) {
+        for (int i = 0; i < nx; ++i) {
+            const size_t k = j*nx + i;
+            int ir = int(255.99f*fb[k].r());
+            int ig = int(255.99f*fb[k].g());
+            int ib = int(255.99f*fb[k].b());
+            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+        }
+    }
+
+    // --- Clean up ---
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_rand_state));
+    checkCudaErrors(cudaFree(fb));
+    cudaDeviceReset();
+    return 0;
+}
+
+int cornell_box() 
+{
+    int nx = 600, ny = 600, ns = 500;
+    float gamma = 2.2f;
+    int tx = 8, ty = 8;
+
+    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
+
+    int num_pixels = nx * ny;
+    size_t fb_size = num_pixels * sizeof(vec3);
+    vec3 *fb; checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+
+    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void**)&d_rand_state,  num_pixels*sizeof(curandState)));
+    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void**)&d_rand_state2, sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+
+    camera **d_camera; checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
+    const int num_hitables = 6; // the 6 Cornell quads shown
+    hittable **d_list;  checkCudaErrors(cudaMalloc((void**)&d_list,  num_hitables * sizeof(hittable*)));
+    hittable **d_world; checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hittable*)));
+
+    create_world_cornell<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);              checkCudaErrors(cudaDeviceSynchronize());
+    render     <<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state,
+                                     /*background*/ vec3(0,0,0), /*use_gradient_bg*/ 0);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
+        size_t k = j*nx + i;
+        int ir = int(255.99f*fb[k].r());
+        int ig = int(255.99f*fb[k].g());
+        int ib = int(255.99f*fb[k].b());
+        std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+    }
+
+    // --- Clean up ---
+    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
@@ -644,12 +870,14 @@ int quads_scene() {
 
 int main() 
 {
-    switch (5) 
+    switch (6) 
     {
         case 1: bouncing_spheres();
         case 2: checkered_spheres();
         case 3: earth();
         case 4: perlin();
         case 5: quads_scene();
+        case 6: simple_light();
+        case 7: cornell_box();
     }
 }

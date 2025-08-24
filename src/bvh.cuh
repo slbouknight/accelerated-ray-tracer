@@ -45,6 +45,8 @@ class bvh_node : public hittable {
 public:
     __device__ bvh_node() : left(nullptr), right(nullptr), box() {}
 
+    __device__ HKind kind() const override { return HK_BVH; }
+
     // Build over list [start, end)
     __device__ bvh_node(hittable** list, int start, int end) : left(nullptr), right(nullptr), box() {
         int n = end - start;

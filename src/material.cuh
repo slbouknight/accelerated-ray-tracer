@@ -47,6 +47,10 @@ class material
 {
 public:
     __device__ virtual ~material() {}
+    __device__ virtual vec3 emitted(float /*u*/, float /*v*/, const vec3& /*p*/) const 
+    {
+        return vec3(0.f, 0.f, 0.f);
+    }
     __device__ virtual bool scatter(
         const ray& r_in, const hit_record& rec,
         vec3& attenuation, ray& scattered,
@@ -58,6 +62,7 @@ public:
 class lambertian : public material {
 public:
     texture* tex; // not owning
+    __device__ ~lambertian() override { if (tex) delete tex; }
 
     // convenience ctor: solid color
     __device__ lambertian(const vec3& albedo)
@@ -152,4 +157,27 @@ public:
 
         return true;
     }
+};
+
+class diffuse_light : public material 
+{
+public:
+    __device__ diffuse_light(texture* t) : tex(t) {}
+    __device__ diffuse_light(const vec3& c) : tex(nullptr), solid(c) {}
+    __device__ ~diffuse_light() override { if (tex) delete tex; }
+
+    __device__ vec3 emitted(float u, float v, const vec3& p) const override 
+    {
+        return tex ? tex->value(u, v, p) : solid;
+    }
+
+    // lights don’t scatter
+    __device__ bool scatter(const ray&, const hit_record&, vec3&, ray&, curandState*) const override 
+    {
+        return false;
+    }
+
+private:
+    texture* tex;     // optional
+    vec3     solid;   // used if tex == nullptr
 };

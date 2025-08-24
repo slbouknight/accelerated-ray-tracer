@@ -5,56 +5,79 @@
 #include "material.cuh"
 #include "vec3.cuh"
 
-class quad : public hittable {
+class quad : public hittable 
+{
 public:
-    vec3 Q, u, v;      // origin + edge vectors
-    vec3 w;            // for interior test
-    vec3 normal;       // unit normal
-    float D;           // plane constant
+    vec3 Q, u, v;        // origin + edge vectors
+    vec3 w;              // for interior test in plane
+    vec3 normal;         // geometric unit normal (from cross(u,v), possibly flipped by 'inward')
+    float D;             // plane constant: dot(n, Q)
     aabb  bbox;
     material* mat_ptr;
+    bool inward;         // if true, flip the geometric normal
+    bool owns_mat;       // delete material in dtor if true
 
-    __device__ quad(const vec3& Q_, const vec3& u_, const vec3& v_, material* m)
-        : Q(Q_), u(u_), v(v_), mat_ptr(m)
-    {
-        vec3 n = cross(u, v);
+    // NOTE: the 5th arg is *inward*, 6th arg is *owns_mat* (defaults true to preserve old call sites)
+    __device__ quad(const vec3& Q_, const vec3& u_, const vec3& v_,
+                    material* m, bool inward_ = false, bool owns_ = true)
+        : Q(Q_), u(u_), v(v_), mat_ptr(m), inward(inward_), owns_mat(owns_) {
+
+        vec3 n = cross(u, v);             // (u,v) order matters!
         normal = unit_vector(n);
-        D      = dot(normal, Q);
-        w      = n / dot(n, n);
+        if (inward) normal = -normal;     // flip if caller asked for inward-facing
+
+        D = dot(normal, Q);
+        w = n / dot(n, n);                // for (alpha,beta) interior test
+
         set_bounding_box();
     }
 
+    __device__ ~quad() override {
+        if (owns_mat && mat_ptr) delete mat_ptr;
+    }
+
+    __device__ HKind kind() const override { return HK_Quad; }
+
     __device__ void set_bounding_box() {
+        // Bounding box from the four corners, padded to avoid zero-thickness slabs.
         aabb d1(Q,       Q + u + v);
         aabb d2(Q + u,   Q + v);
-        // Use your helper + pad to avoid zero-width slabs (matches your style)
-        bbox = aabb::surrounding_box(d1, d2).pad(1e-4f);
+        bbox = aabb::surrounding_box(d1, d2).pad(1e-3f);
+    }
+
+    __device__ aabb bounding_box() const override {
+        return bbox;
     }
 
     __device__ bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const override {
-        float denom = dot(normal, r.direction());
+        const float denom = dot(normal, r.direction());
+
+        // Parallel to plane?
         if (fabsf(denom) < 1e-8f) return false;
 
-        float t = (D - dot(normal, r.origin())) / denom;
+        const float t = (D - dot(normal, r.origin())) / denom;
         if (t < t_min || t > t_max) return false;
 
-        vec3 P  = r.point_at_parameter(t);
-        vec3 pl = P - Q;
+        // Plane coordinates
+        const vec3 P  = r.point_at_parameter(t);
+        const vec3 pl = P - Q;
 
-        float alpha = dot(w, cross(pl, v));
-        float beta  = dot(w, cross(u,  pl));
+        const float alpha = dot(w, cross(pl, v));
+        const float beta  = dot(w, cross(u,  pl));
         if (alpha < 0.f || alpha > 1.f || beta < 0.f || beta > 1.f) return false;
 
+        // Fill hit record
         rec.t       = t;
         rec.p       = P;
         rec.u       = alpha;
         rec.v       = beta;
-        rec.normal  = normal;  // you’re not using front-face in CUDA path
+
+        // Orient shading normal to face the incoming ray (serial's set_face_normal analogue)
+        vec3 n = normal;
+        if (dot(n, r.direction()) > 0.f) n = -n;
+        rec.normal  = n;
+
         rec.mat_ptr = mat_ptr;
         return true;
     }
-
-    // Match your hittable interface exactly:
-    // __device__ virtual aabb bounding_box() const = 0;
-    __device__ aabb bounding_box() const override { return bbox; }
 };
