@@ -11,6 +11,13 @@ class interval {
 
     interval(double min, double max) : min(min), max(max) {}
 
+    interval(const interval& a, const interval& b)
+    {
+        // Make a new interval given two input intervals
+        min = a.min <= b.min ? a.min: b.min;
+        max = a.max >= b.max ? a.max: b.max;
+    }
+
     double size() const 
     {
         return max - min;
@@ -33,10 +40,26 @@ class interval {
         return x;
     }
 
+    interval expand(double delta) const
+    {
+        auto padding = delta / 2;
+        return interval(min - padding, max + padding);
+    }
+
     static const interval empty, universe;
 };
 
 const interval interval::empty    = interval(+infinity, -infinity);
 const interval interval::universe = interval(-infinity, +infinity);
+
+interval operator+(const interval& ival, double displacement) 
+{
+    return interval(ival.min + displacement, ival.max + displacement);
+}
+
+interval operator+(double displacement, const interval& ival) 
+{
+    return ival + displacement;
+}
 
 #endif
