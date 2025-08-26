@@ -357,21 +357,29 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
 {
     if (threadIdx.x || blockIdx.x) return;
     int i = 0;
-    material* red    = new lambertian(vec3(.65f,.05f,.05f));          // unique
-    material* green  = new lambertian(vec3(.12f,.45f,.15f));          // unique
-    material* white1 = new lambertian(vec3(.73f,.73f,.73f));          // floor
-    material* white2 = new lambertian(vec3(.73f,.73f,.73f));          // ceiling
-    material* white3 = new lambertian(vec3(.73f,.73f,.73f));          // back
-    material* light  = new diffuse_light(vec3(15.f,15.f,15.f));       // unique
 
-    // quads with inward normals
-    d_list[i++] = new quad(vec3(0,0,0),       vec3(0,555,0),  vec3(0,0,555),  green,  true);
-    d_list[i++] = new quad(vec3(555,0,555),   vec3(0,555,0),  vec3(0,0,-555), red,    true);
-    d_list[i++] = new quad(vec3(0,0,0),       vec3(555,0,0),  vec3(0,0,555),  white1, true);
-    d_list[i++] = new quad(vec3(0,555,555),   vec3(555,0,0),  vec3(0,0,-555), white2, true);
-    d_list[i++] = new quad(vec3(555,0,555),   vec3(-555,0,0), vec3(0,555,0),  white3, true);
-    d_list[i++] = new quad(vec3(213,554,227), vec3(130,0,0),  vec3(0,0,105),  light,  true);
+    // Only 3 lambertian materials
+    material* red    = new lambertian(vec3(.65f,.05f,.05f));
+    material* green  = new lambertian(vec3(.12f,.45f,.15f));
+    material* white  = new lambertian(vec3(.73f,.73f,.73f));   // reuse everywhere
+    material* light  = new diffuse_light(vec3(15.f,15.f,15.f));
 
+    // Cornell walls (inward-facing quads)
+    d_list[i++] = new quad(vec3(0,0,0),       vec3(0,555,0),  vec3(0,0,555),  green,  true); // left
+    d_list[i++] = new quad(vec3(555,0,555),   vec3(0,555,0),  vec3(0,0,-555), red,    true); // right
+    d_list[i++] = new quad(vec3(0,0,0),       vec3(555,0,0),  vec3(0,0,555),  white,  true); // floor
+    d_list[i++] = new quad(vec3(0,555,555),   vec3(555,0,0),  vec3(0,0,-555), white,  true); // ceiling
+    d_list[i++] = new quad(vec3(555,0,555),   vec3(-555,0,0), vec3(0,555,0),  white,  true); // back
+    d_list[i++] = new quad(vec3(213,554,227), vec3(130,0,0),  vec3(0,0,105),  light,  true); // light
+
+    // ---- Instanced boxes ----
+    // Build two *properly sized* prototypes (same geometry type, different height).
+    hittable* proto_short = make_box(vec3(0,0,0), vec3(165,165,165), white);
+    hittable* proto_tall  = make_box(vec3(0,0,0), vec3(165,330,165), white);
+
+    // Place them using the canonical Cornell transforms.
+    d_list[i++] = new translate(new rotate_y(proto_short, -18.f), vec3(130.f, 0.f,  65.f));
+    d_list[i++] = new translate(new rotate_y(proto_tall,   15.f), vec3(265.f, 0.f, 295.f));
 
     *d_world = new bvh_node(d_list, 0, i);
 
@@ -813,7 +821,7 @@ int simple_light()
 
 int cornell_box() 
 {
-    int nx = 600, ny = 600, ns = 500;
+    int nx = 600, ny = 600, ns = 1000;
     float gamma = 2.2f;
     int tx = 8, ty = 8;
 
@@ -870,7 +878,7 @@ int cornell_box()
 
 int main() 
 {
-    switch (6) 
+    switch (7) 
     {
         case 1: bouncing_spheres();
         case 2: checkered_spheres();

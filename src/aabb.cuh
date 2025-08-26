@@ -72,4 +72,11 @@ __host__ __device__ static aabb universe()
                 vec3( FLT_MAX,  FLT_MAX,  FLT_MAX));
 }
 
+// Shift an AABB by an offset (component-wise).
+__host__ __device__ inline aabb operator+(const aabb& box, const vec3& offset) 
+{
+    return aabb(box.minimum + offset, box.maximum + offset);
+}
+
+
 #endif

@@ -1,4 +1,7 @@
 #pragma once
+
+#include <math.h>
+
 #include "hittable.cuh"
 #include "aabb.cuh"
 #include "ray.cuh"
@@ -81,3 +84,69 @@ public:
         return true;
     }
 };
+
+// Concrete container for exactly six faces (a box). No interval usage.
+class compound6 : public hittable {
+public:
+    hittable* faces[6];
+    aabb      box;
+
+    __device__ compound6(hittable* f0, hittable* f1, hittable* f2,
+                         hittable* f3, hittable* f4, hittable* f5) {
+        faces[0]=f0; faces[1]=f1; faces[2]=f2;
+        faces[3]=f3; faces[4]=f4; faces[5]=f5;
+
+        // Union the child AABBs
+        box = faces[0]->bounding_box();
+        #pragma unroll
+        for (int i=1;i<6;++i) {
+            const aabb b = faces[i]->bounding_box();
+            const vec3 mn(fminf(box.minimum.x(), b.minimum.x()),
+                          fminf(box.minimum.y(), b.minimum.y()),
+                          fminf(box.minimum.z(), b.minimum.z()));
+            const vec3 mx(fmaxf(box.maximum.x(), b.maximum.x()),
+                          fmaxf(box.maximum.y(), b.maximum.y()),
+                          fmaxf(box.maximum.z(), b.maximum.z()));
+            box = aabb(mn, mx);
+        }
+    }
+
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec) const override {
+        // No AABB early-out that mutates intervals; just do a closest-hit scan.
+        bool  hit_any = false;
+        float closest = tmax;
+
+        #pragma unroll
+        for (int i=0;i<6;++i) {
+            hit_record tmp;
+            if (faces[i]->hit(r, tmin, closest, tmp)) {
+                hit_any = true;
+                closest = tmp.t;
+                rec     = tmp;
+            }
+        }
+        return hit_any;
+    }
+
+    __device__ aabb bounding_box() const override { return box; }
+    __device__ HKind kind() const override { return HK_Composite; }
+};
+
+__device__ inline hittable* make_box(const vec3& a, const vec3& b, material* mat) 
+{
+    const vec3 minp(fminf(a.x(), b.x()), fminf(a.y(), b.y()), fminf(a.z(), b.z()));
+    const vec3 maxp(fmaxf(a.x(), b.x()), fmaxf(a.y(), b.y()), fmaxf(a.z(), b.z()));
+
+    const vec3 dx(maxp.x() - minp.x(), 0.f, 0.f);
+    const vec3 dy(0.f, maxp.y() - minp.y(), 0.f);
+    const vec3 dz(0.f, 0.f, maxp.z() - minp.z());
+
+    hittable* front  = new quad(vec3(minp.x(), minp.y(), maxp.z()),  dx,  dy, mat); // +Z
+    hittable* right  = new quad(vec3(maxp.x(), minp.y(), maxp.z()), -dz,  dy, mat); // +X
+    hittable* back   = new quad(vec3(maxp.x(), minp.y(), minp.z()), -dx,  dy, mat); // -Z
+    hittable* left   = new quad(vec3(minp.x(), minp.y(), minp.z()),  dz,  dy, mat); // -X
+    hittable* top    = new quad(vec3(minp.x(), maxp.y(), maxp.z()),  dx, -dz, mat); // +Y
+    hittable* bottom = new quad(vec3(minp.x(), minp.y(), minp.z()),  dx,  dz, mat); // -Y
+
+    return new compound6(front, right, back, left, top, bottom);
+}
