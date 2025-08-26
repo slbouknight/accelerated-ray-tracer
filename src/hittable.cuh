@@ -25,6 +25,10 @@ class hittable
     public:
         __device__ virtual ~hittable() = default;
         __device__ virtual bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const = 0;
+        __device__ virtual bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* rng) const 
+        {
+            return hit(r, tmin, tmax, rec);
+        }
         __device__ virtual aabb bounding_box() const = 0;
         __device__ virtual HKind kind() const = 0;
 };
@@ -39,6 +43,11 @@ public:
     hittable* obj;
     vec3      offset;
     aabb      box;
+
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+    {
+        return hit(r, tmin, tmax, rec);
+    }
 
     __device__ translate(hittable* p, const vec3& d) : obj(p), offset(d) {
         box = obj->bounding_box() + d;  // uses aabb+vec3 helper
@@ -71,6 +80,11 @@ public:
     hittable* obj;
     float     sin_t, cos_t;
     aabb      box;
+
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+    {
+        return hit(r, tmin, tmax, rec);
+    }
 
     __device__ rotate_y(hittable* p, float angle_degrees) : obj(p) {
         const float rad = angle_degrees * 0.017453292519943295769f; // pi/180
@@ -144,6 +158,11 @@ public:
     material*  mat;
     aabb       box;
 
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+    {
+        return hit(r, tmin, tmax, rec);
+    }
+    
     __device__ with_material(hittable* p, material* m) : obj(p), mat(m) {
         box = obj->bounding_box();
     }

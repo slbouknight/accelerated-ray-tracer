@@ -181,3 +181,21 @@ private:
     texture* tex;     // optional
     vec3     solid;   // used if tex == nullptr
 };
+
+class isotropic : public material 
+{
+public:
+    texture* tex; // owns
+    __device__ isotropic(texture* t) : tex(t) {}
+    __device__ isotropic(const vec3& c) : tex(new solid_color(c)) {}
+    __device__ ~isotropic() override { if (tex) delete tex; }
+
+    __device__ bool scatter(const ray& r_in, const hit_record& rec,
+                            vec3& attenuation, ray& scattered,
+                            curandState* rng) const override {
+        // Sample random direction uniformly over the sphere
+        scattered   = ray(rec.p, random_in_unit_sphere(rng), r_in.time());
+        attenuation = tex->value(rec.u, rec.v, rec.p);
+        return true;
+    }
+};

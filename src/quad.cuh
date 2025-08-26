@@ -20,6 +20,11 @@ public:
     bool inward;         // if true, flip the geometric normal
     bool owns_mat;       // delete material in dtor if true
 
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+    {
+        return hit(r, tmin, tmax, rec);
+    }
+
     // NOTE: the 5th arg is *inward*, 6th arg is *owns_mat* (defaults true to preserve old call sites)
     __device__ quad(const vec3& Q_, const vec3& u_, const vec3& v_,
                     material* m, bool inward_ = false, bool owns_ = true)
@@ -91,6 +96,11 @@ public:
     hittable* faces[6];
     aabb      box;
 
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+    {
+        return hit(r, tmin, tmax, rec);
+    }
+    
     __device__ compound6(hittable* f0, hittable* f1, hittable* f2,
                          hittable* f3, hittable* f4, hittable* f5) {
         faces[0]=f0; faces[1]=f1; faces[2]=f2;

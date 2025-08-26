@@ -8,6 +8,7 @@
 
 #include "bvh.cuh"
 #include "camera.cuh"
+#include "constant_medium.cuh"
 #include "hittable_list.cuh"
 #include "image_io.h"
 #include "material.cuh"
@@ -16,6 +17,7 @@
 #include "quad.cuh"
 #include "sphere.cuh"
 #include "texture.cuh"
+#include "util.cuh"
 #include "vec3.cuh"
 
 #define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
@@ -52,7 +54,7 @@ __device__ vec3 color(const ray& r0,
     for (int bounce = 0; bounce < 50; ++bounce) 
     {
         hit_record rec;
-        if (!(*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+        if (!(*world)->hit(cur_ray, 0.001f, FLT_MAX, rec, local_rand_state)) {
             // miss: add background
             vec3 bg = background;
             if (gradient_bg) 
@@ -389,6 +391,103 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
     *d_camera = new camera(lookfrom, lookat, vup,
                            40.0f, float(nx)/float(ny),
                            0.0f, dist_to_focus,
+                           0.0, 1.0);
+}
+
+__global__ void create_world_cornell_smoke(hittable **d_list, hittable
+ **d_world, camera **d_camera, int nx, int ny)
+{ 
+	if (threadIdx.x || blockIdx.x) return;
+	int i = 0; material* red = new lambertian(vec3(.65f, .05f, .05f));
+ 	material* white = new lambertian(vec3(.73f, .73f, .73f)); 
+	material* green = new lambertian(vec3(.12f, .45f, .15f)); 
+	material* light = new diffuse_light(vec3(7.f, 7.f, 7.f)); // Walls (inward-facing) 
+	d_list[i++] = new quad(vec3(555,0,0), vec3(0,555,0), vec3(0,0,555), green, true); 
+	d_list[i++] = new quad(vec3(0,0,0), vec3(0,555,0), vec3(0,0,555), red, true); 
+	d_list[i++] = new quad(vec3(0,555,0), vec3(555,0,0), vec3(0,0,555), white, true); 
+	d_list[i++] = new quad(vec3(0,0,0), vec3(555,0,0), vec3(0,0,555), white, true); 
+	d_list[i++] = new quad(vec3(0,0,555), vec3(555,0,0), vec3(0,555,0), white, true); 
+	d_list[i++] = new quad(vec3(113,554,127), vec3(330,0,0), vec3(0,0,305), light, true); 
+
+	// Two boxes -> rotate/translate -> wrap each in constant_medium 
+	hittable* b1 = make_box(vec3(0,0,0), vec3(165,330,165), white); 
+	b1 = new translate(new rotate_y(b1, 15.f), vec3(265.f,0.f,295.f)); 
+	hittable* b2 = make_box(vec3(0,0,0), vec3(165,165,165), white); 
+	b2 = new translate(new rotate_y(b2,-18.f), vec3(130.f,0.f, 65.f)); 
+	d_list[i++] = new constant_medium(b1, 0.01f, vec3(0.5,0.5,0.5)); // black smoke 
+	d_list[i++] = new constant_medium(b2, 0.01f, vec3(1,1,1)); // white smoke 
+	*d_world = new bvh_node(d_list, 0, i); 
+	
+	// Camera 
+	vec3 lookfrom(278, 278, -800), lookat(278, 278, 0), vup(0,1,0); 
+	float dist = (lookfrom - lookat).length(); 
+	*d_camera = new camera(lookfrom, lookat, vup, 40.0f, float(nx)/float(ny), 0.0f, dist, 0.0f, 1.0f); 
+}
+
+__global__ void create_world_final(hittable **d_list, hittable **d_world, camera **d_camera,
+                                   int nx, int ny, DeviceImage earth_img) {
+    if (threadIdx.x || blockIdx.x) return;
+
+    int i = 0;
+    material* white = new lambertian(vec3(.73f,.73f,.73f));
+    material* ground= new lambertian(vec3(0.48f,0.83f,0.53f));
+    material* light = new diffuse_light(vec3(7,7,7));
+
+    // --- Boxes "ground" 20x20 with random heights
+    const int S = 20;
+    for (int ix=0; ix<S; ++ix) for (int iz=0; iz<S; ++iz) {
+        float w  = 100.0f;
+        float x0 = -1000.0f + ix*w;
+        float z0 = -1000.0f + iz*w;
+        float y1 = 1.0f + 100.0f * ( (ix*13 + iz*37) % 100 ) / 100.0f; // stable pseudo-rand
+        d_list[i++] = make_box(vec3(x0,0,z0), vec3(x0+w,y1,z0+w), ground);
+    }
+
+    // --- Area light quad
+    d_list[i++] = new quad(vec3(123,554,147), vec3(300,0,0), vec3(0,0,265), light, true);
+
+    // --- Moving lambertian sphere
+    vec3 c1(400,400,200), c2 = c1 + vec3(30,0,0);
+    d_list[i++] = new sphere(c1, c2, 50.f, new lambertian(vec3(0.7f,0.3f,0.1f)));
+
+    // --- Glass & metal spheres
+    d_list[i++] = new sphere(vec3(260,150,45), 50.f, new dielectric(1.5f));
+    d_list[i++] = new sphere(vec3(0,150,145),  50.f, new metal(vec3(0.8f,0.8f,0.9f), 1.0f));
+
+    // --- Blue fog sphere inside glass boundary
+    hittable* boundary = new sphere(vec3(360,150,145), 70.f, new dielectric(1.5f));
+    d_list[i++] = boundary; // boundary surface visible too (like the book)
+    d_list[i++] = new constant_medium(new sphere(vec3(360,150,145), 70.f, new dielectric(1.5f)),
+                                      0.2f, vec3(0.2f,0.4f,0.9f));
+
+    // --- Global thin white fog
+    d_list[i++] = new constant_medium(new sphere(vec3(0,0,0), 5000.f, new dielectric(1.5f)),
+                                      0.0001f, vec3(1,1,1));
+
+    // --- Earth-textured sphere
+    texture* earth_tex = new image_texture(earth_img);
+    d_list[i++] = new sphere(vec3(400,200,400), 100.f, new lambertian(earth_tex));
+
+    // --- Perlin sphere
+    d_list[i++] = new sphere(vec3(220,280,300), 80.f, new lambertian(new noise_texture(0.2f)));
+
+    // --- Cluster of 1000 white balls, rotated and translated
+    //     (push leaves directly; BVH will be built over ALL objects)
+    for (int j=0; j<1000; ++j) {
+        vec3 p = random_in_unit_cube(j) * 165.0f;   // you can implement a tiny helper
+        d_list[i++] = new sphere(p, 10.f, white);
+    }
+    // rotate + translate the cluster by wrapping in transforms per-object
+    // (If your sphere type doesn’t bake transforms, build them as instanced wrappers)
+    // Simpler alternative: skip per-object transforms here for brevity.
+
+    *d_world = new bvh_node(d_list, 0, i);
+
+    // Camera
+    vec3 lookfrom(478,278,-600), lookat(278,278,0), vup(0,1,0);
+    *d_camera = new camera(lookfrom, lookat, vup,
+                           40.0f, float(nx)/float(ny),
+                           0.0f, (lookfrom-lookat).length(),
                            0.0, 1.0);
 }
 
@@ -876,9 +975,119 @@ int cornell_box()
     return 0;
 }
 
+void cornell_smoke() {
+    int nx=600, ny=600, ns=1000; float gamma=2.2f; int tx=8, ty=8;
+
+    cudaDeviceSetLimit(cudaLimitStackSize,      65536);           // was 16384
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);   // was 64 MB
+
+    // Framebuffer + RNGs
+    int num_pixels = nx*ny;
+    size_t fb_size = num_pixels * sizeof(vec3);
+    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
+    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
+    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+
+    // Scene allocations
+    camera **d_camera; checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+    // 5 walls + light + 2 media = 8 objects
+    int num_hitables = 8;
+    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables * sizeof(hittable *)));
+    checkCudaErrors(cudaMemset(d_list, 0, num_hitables * sizeof(hittable*)));
+    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
+
+    create_world_cornell_smoke<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 0);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // Output PPM to stdout (matches your other scenes)
+    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    for (int j = ny - 1; j >= 0; --j) {
+        for (int i = 0; i < nx; ++i) {
+            const size_t k = j * nx + i;
+            int ir = int(255.99f * fb[k].r());
+            int ig = int(255.99f * fb[k].g());
+            int ib = int(255.99f * fb[k].b());
+            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+        }
+    }
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);
+    checkCudaErrors(cudaDeviceSynchronize());
+    cudaFree(d_rand_state); cudaFree(d_rand_state2); cudaFree(fb);
+    cudaFree(d_list); cudaFree(d_world); cudaFree(d_camera);
+    cudaDeviceReset();
+}
+
+void final_scene() {
+    int nx=800, ny=800, ns=100; float gamma=2.2f; int tx=8, ty=8;
+
+    cudaDeviceSetLimit(cudaLimitStackSize,      32768);          // 32 KB
+    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);  // 256 MB
+
+    // Load earth texture to device (same as your earth() scene)
+    unsigned char* d_pixels = nullptr;
+    DeviceImage earth_img = load_image_to_device("textures/earthmap.jpg", &d_pixels);
+    earth_img = load_image_to_device("textures/earthmap.jpg", &d_pixels);
+    if (!earth_img.valid()) { std::cerr << "Failed to load earthmap.jpg\n"; return; }
+
+    // Framebuffer + RNGs
+    int num_pixels = nx*ny; size_t fb_size = num_pixels*sizeof(vec3);
+    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
+    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
+    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+
+    // Scene allocations (upper bound ~ 1600 leaves)
+    int num_hitables = 1800;
+    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables*sizeof(hittable *)));
+    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
+    camera   **d_camera;checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+
+    create_world_final<<<1,1>>>(d_list, d_world, d_camera, nx, ny, earth_img);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
+    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 0);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // Output PPM to stdout (matches your other scenes)
+    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    for (int j = ny - 1; j >= 0; --j) {
+        for (int i = 0; i < nx; ++i) {
+            const size_t k = j * nx + i;
+            int ir = int(255.99f * fb[k].r());
+            int ig = int(255.99f * fb[k].g());
+            int ib = int(255.99f * fb[k].b());
+            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+        }
+    }
+
+    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    cudaFree(d_rand_state); 
+    cudaFree(d_rand_state2); 
+    cudaFree(fb);
+    cudaFree(d_list); 
+    cudaFree(d_world); 
+    cudaFree(d_camera);
+
+    // Free device pixels for the earth texture (same as earth())
+    free_device_image(earth_img);
+
+    cudaDeviceReset();
+}
+
 int main() 
 {
-    switch (7) 
+    switch (8) 
     {
         case 1: bouncing_spheres();
         case 2: checkered_spheres();
@@ -887,5 +1096,7 @@ int main()
         case 5: quads_scene();
         case 6: simple_light();
         case 7: cornell_box();
+        case 8: cornell_smoke();  break;
+        case 9: final_scene();    break;
     }
 }

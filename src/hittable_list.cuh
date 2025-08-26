@@ -25,21 +25,26 @@ public:
         // if n == 0, bbox stays as the default-constructed (empty) box
     }
 
-    __device__ bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const override 
-    {
-        hit_record temp_rec;
-        bool hit_anything = false;
-        float closest_so_far = t_max;
+    // 4-arg legacy override: actual implementation
+    __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec) const override {
+        hit_record temp;
+        bool hit_any = false;
+        float closest = tmax;
 
         for (int i = 0; i < list_size; ++i) {
-            if (list[i]->hit(r, t_min, closest_so_far, temp_rec)) 
-            {
-                hit_anything = true;
-                closest_so_far = temp_rec.t;
-                rec = temp_rec;
+            if (list[i]->hit(r, tmin, closest, temp)) {
+                hit_any = true;
+                closest = temp.t;
+                rec = temp;
             }
         }
-        return hit_anything;
+        return hit_any;
+    }
+
+    // 5-arg RNG overload: forward to 4-arg
+    __device__ bool hit(const ray& r, float tmin, float tmax,
+                        hit_record& rec, curandState* /*rng*/) const override {
+        return hit(r, tmin, tmax, rec);
     }
 
     __device__ aabb bounding_box() const override { return bbox; }

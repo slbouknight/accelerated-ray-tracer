@@ -12,6 +12,11 @@ class sphere : public hittable
     public:
         __device__ sphere() {}
 
+        __device__ bool hit(const ray& r, float tmin, float tmax, hit_record& rec, curandState* /*rng*/) const override 
+        {
+            return hit(r, tmin, tmax, rec);
+        }
+
         // Static sphere -> zero velocity
         __device__ sphere(vec3 cen, float r, material* m, bool owns=true)
             : center(ray(cen, vec3(0,0,0), 0.0)), radius(r), mat_ptr(m), owns_mat(owns)
