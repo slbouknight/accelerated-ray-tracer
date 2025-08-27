@@ -394,34 +394,50 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
                            0.0, 1.0);
 }
 
-__global__ void create_world_cornell_smoke(hittable **d_list, hittable
- **d_world, camera **d_camera, int nx, int ny)
-{ 
-	if (threadIdx.x || blockIdx.x) return;
-	int i = 0; material* red = new lambertian(vec3(.65f, .05f, .05f));
- 	material* white = new lambertian(vec3(.73f, .73f, .73f)); 
-	material* green = new lambertian(vec3(.12f, .45f, .15f)); 
-	material* light = new diffuse_light(vec3(7.f, 7.f, 7.f)); // Walls (inward-facing) 
-	d_list[i++] = new quad(vec3(555,0,0), vec3(0,555,0), vec3(0,0,555), green, true); 
-	d_list[i++] = new quad(vec3(0,0,0), vec3(0,555,0), vec3(0,0,555), red, true); 
-	d_list[i++] = new quad(vec3(0,555,0), vec3(555,0,0), vec3(0,0,555), white, true); 
-	d_list[i++] = new quad(vec3(0,0,0), vec3(555,0,0), vec3(0,0,555), white, true); 
-	d_list[i++] = new quad(vec3(0,0,555), vec3(555,0,0), vec3(0,555,0), white, true); 
-	d_list[i++] = new quad(vec3(113,554,127), vec3(330,0,0), vec3(0,0,305), light, true); 
+__global__ void create_world_cornell_smoke(hittable **d_list, hittable **d_world, camera **d_camera,
+                                           int nx, int ny) {
+    if (threadIdx.x || blockIdx.x) return;
+    int i = 0;
 
-	// Two boxes -> rotate/translate -> wrap each in constant_medium 
-	hittable* b1 = make_box(vec3(0,0,0), vec3(165,330,165), white); 
-	b1 = new translate(new rotate_y(b1, 15.f), vec3(265.f,0.f,295.f)); 
-	hittable* b2 = make_box(vec3(0,0,0), vec3(165,165,165), white); 
-	b2 = new translate(new rotate_y(b2,-18.f), vec3(130.f,0.f, 65.f)); 
-	d_list[i++] = new constant_medium(b1, 0.01f, vec3(0.5,0.5,0.5)); // black smoke 
-	d_list[i++] = new constant_medium(b2, 0.01f, vec3(1,1,1)); // white smoke 
-	*d_world = new bvh_node(d_list, 0, i); 
-	
-	// Camera 
-	vec3 lookfrom(278, 278, -800), lookat(278, 278, 0), vup(0,1,0); 
-	float dist = (lookfrom - lookat).length(); 
-	*d_camera = new camera(lookfrom, lookat, vup, 40.0f, float(nx)/float(ny), 0.0f, dist, 0.0f, 1.0f); 
+    material* red   = new lambertian(vec3(.65f, .05f, .05f));
+    material* white = new lambertian(vec3(.73f, .73f, .73f));
+    material* green = new lambertian(vec3(.12f, .45f, .15f));
+    material* light = new diffuse_light(vec3(7.f, 7.f, 7.f));
+
+    // Walls (inward-facing)
+    d_list[i++] = new quad(vec3(555,0,0),   vec3(0,555,0),  vec3(0,0,555),  green, true);
+    d_list[i++] = new quad(vec3(0,0,0),     vec3(0,555,0),  vec3(0,0,555),  red,   true);
+    d_list[i++] = new quad(vec3(0,555,0),   vec3(555,0,0),  vec3(0,0,555),  white, true);
+    d_list[i++] = new quad(vec3(0,0,0),     vec3(555,0,0),  vec3(0,0,555),  white, true);
+    d_list[i++] = new quad(vec3(0,0,555),   vec3(555,0,0),  vec3(0,555,0),  white, true);
+    d_list[i++] = new quad(vec3(113,554,127), vec3(330,0,0), vec3(0,0,305), light, true);
+
+    // Two boxes -> rotate/translate -> wrap each in constant_medium
+    hittable* b1 = make_box(vec3(0,0,0), vec3(165,330,165), white);
+    b1 = new translate(new rotate_y(b1, 15.f), vec3(265.f,0.f,295.f));
+    hittable* b2 = make_box(vec3(0,0,0), vec3(165,165,165), white);
+    b2 = new translate(new rotate_y(b2,-18.f), vec3(130.f,0.f, 65.f));
+
+    d_list[i++] = new constant_medium(b1, 0.01f, vec3(0.5,0.5,0.5)); // black smoke
+    d_list[i++] = new constant_medium(b2, 0.01f, vec3(1,1,1)); // white smoke
+
+    *d_world = new bvh_node(d_list, 0, i);
+
+    // Camera
+    vec3 lookfrom(278, 278, -800), lookat(278, 278, 0), vup(0,1,0);
+    float dist = (lookfrom - lookat).length();
+    *d_camera = new camera(lookfrom, lookat, vup, 40.0f, float(nx)/float(ny),
+                           0.0f, dist, 0.0f, 1.0f);
+}
+
+// degrees -> radians
+__device__ inline float deg2rad(float d) { return d * 0.017453292519943295f; }
+
+__device__ inline vec3 rotate_y_deg(const vec3& p, float deg) {
+    float r = deg2rad(deg);
+    float c = cosf(r), s = sinf(r);
+    // R_y * p
+    return vec3(c*p.x() + s*p.z(), p.y(), -s*p.x() + c*p.z());
 }
 
 __global__ void create_world_final(hittable **d_list, hittable **d_world, camera **d_camera,
@@ -471,15 +487,14 @@ __global__ void create_world_final(hittable **d_list, hittable **d_world, camera
     // --- Perlin sphere
     d_list[i++] = new sphere(vec3(220,280,300), 80.f, new lambertian(new noise_texture(0.2f)));
 
-    // --- Cluster of 1000 white balls, rotated and translated
-    //     (push leaves directly; BVH will be built over ALL objects)
-    for (int j=0; j<1000; ++j) {
-        vec3 p = random_in_unit_cube(j) * 165.0f;   // you can implement a tiny helper
-        d_list[i++] = new sphere(p, 10.f, white);
+    // --- Cluster of 1000 white balls (bake transform per-point)
+    const int ns = 1000;
+    for (int j = 0; j < ns; ++j) 
+    {
+        vec3 p = random_in_unit_cube(j) * 165.0f;   // see note below
+        p = rotate_y_deg(p, 15.0f) + vec3(-100, 270, 395);  // match CPU scene
+        d_list[i++] = new sphere(p, 10.0f, white);
     }
-    // rotate + translate the cluster by wrapping in transforms per-object
-    // (If your sphere type doesn’t bake transforms, build them as instanced wrappers)
-    // Simpler alternative: skip per-object transforms here for brevity.
 
     *d_world = new bvh_node(d_list, 0, i);
 
@@ -1025,7 +1040,7 @@ void cornell_smoke() {
 }
 
 void final_scene() {
-    int nx=800, ny=800, ns=100; float gamma=2.2f; int tx=8, ty=8;
+    int nx=800, ny=800, ns=10000; float gamma=2.2f; int tx=8, ty=8;
 
     cudaDeviceSetLimit(cudaLimitStackSize,      32768);          // 32 KB
     cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);  // 256 MB
@@ -1087,7 +1102,7 @@ void final_scene() {
 
 int main() 
 {
-    switch (8) 
+    switch (9) 
     {
         case 1: bouncing_spheres();
         case 2: checkered_spheres();
