@@ -1,9 +1,15 @@
 # CUDA Accelerated Ray Tracer
 
-A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, thin‑lens depth of field, metal/dielectric materials, and the randomized final scene. The code mirrors the book’s progression, adapted for GPU kernels and CUDA memory/launch patterns.
-![Final spheres render](images/spheres.png)
+A CUDA implementation of the **_Ray Tracing in One Weekend_** Book Series with per-pixel RNG, thin-lens depth of field, metal/dielectric materials, procedural textures, <br>
+quads, instancing, light sources, Cornell box, texture mapping, and the randomized final scene. The code mirrors the books’ progression, adapted for GPU kernels and<br>
+CUDA memory/launch patterns.
+
+<p align="left">
+  <img src="images/finalScene.png" alt="Demo" height="800"/>
+</p>
+
 > References  
-> • Peter Shirley, _Ray Tracing in One Weekend_ — https://raytracing.github.io/  
+> • Peter Shirley, _Ray Tracing in One Weekend_ Book Series — https://raytracing.github.io/  
 > • NVIDIA Developer Blog, “Accelerated Ray Tracing in One Weekend in CUDA” — https://developer.nvidia.com/blog/accelerated-ray-tracing-cuda/
 
 ---
@@ -21,7 +27,6 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
     <img src="images/gamma-correction.png" alt="Gamma correction" width="600"/>
   </p>
 
-
 ### Materials
 - **Metal** with **fuzz** parameter for rough/microfacet reflections  
 - **Lambertian** (diffuse) with random cosine-ish scattering  
@@ -30,22 +35,56 @@ A CUDA implementation of **_Ray Tracing in One Weekend_** with per-pixel RNG, th
     <img src="images/materials.png" alt="Materials" width="600"/>
   </p>
 
-
 ### Camera
-- **Thin‑lens defocus blur (depth of field)** (aperture + focus distance)
+- **Thin-lens defocus blur (depth of field)** (aperture + focus distance)
 - Proper **camera basis** (`u/v/w`) with configurable FOV and aspect ratio
   <p align="left">
       <img src="images/defocus.png" alt="Depth of Field" width="600"/>
   </p>
+
+### Procedural Textures
+- **Checkered planes and spheres**
+- **Perlin noise textures** with turbulence & marble patterns  
+<p align="left">
+  <img src="images/checkered.png" alt="Checkered texture" width="400"/>
+  <img src="images/perlin.png" alt="Perlin texture" width="400"/>
+</p>
 
 ### Motion Blur
 - **Shutter interval sampling**: each ray carries a randomized time in `[time0, time1]`
 - **Animated primitives**: object positions are interpolated across the shutter window
 - Produces natural blur trails when geometry moves during exposure
   <p align="left">
-      <img src="images/motion-blur.png" alt="Motion blur" width="600"/>
+      <img src="images/checkeredBounce.png" alt="Motion blur" width="600"/>
   </p>
 
+### Light Sources
+- **Emissive materials** for area lights
+- Example: Cornell box ceiling quad + glowing sphere  
+<p align="left">
+  <img src="images/simpleLight.png" alt="Simple Light" width="400"/>
+</p>
+
+### Quads & Rectangular Geometry
+- General **quad primitive**
+- Used for walls, floors, ceilings, and light sources  
+<p align="left">
+  <img src="images/quads.png" alt="Quads" width="400"/>
+</p>
+
+### Instancing & Object Transforms
+- Translate / rotate geometry without duplicating vertex data
+- Used to place rotated blocks in the Cornell Box  
+<p align="left">
+  <img src="images/instancing.png" alt="Instancing" width="400"/>
+</p>
+
+### Texture Mapping
+- Spherical coordinate texture mapping
+- Example: Earth texture on a sphere  
+<p align="left">
+  <img src="images/textureWrap.png" alt="Texture Mapping" width="400"/>
+</p>
 
 ---
 
@@ -76,7 +115,7 @@ setup.bat
 rmdir /s /q build
 cmake -S . -B build
 cmake --build build --config Debug
-Build\bin\Debug
+Build\\bin\\Debug
 RayTracer.exe > output.ppm
 ```
 
@@ -86,7 +125,7 @@ RayTracer.exe > output.ppm
 
 - Run after building (Debug example):
   ```bat
-  Build\bin\Debug
+  Build\\bin\\Debug
   rayTracer.exe > output.ppm
   ```
 
@@ -106,10 +145,10 @@ RayTracer.exe > output.ppm
 ## How it works (GPU notes)
 
 - **Bounded depth instead of recursion**: the book’s recursive `color()` is turned into a loop (default max depth = 50) to avoid device stack overflows.
-- **Per‑pixel RNG**: Each thread has a `curandState`. We copy the state to a local variable, sample multiple times, then write it back.
+- **Per-pixel RNG**: Each thread has a `curandState`. We copy the state to a local variable, sample multiple times, then write it back.
 - **Unified memory for the framebuffer** (`cudaMallocManaged`) to simplify host readout (`stdout` → PPM).
 - **Device-side scene build**: A small kernel constructs the world and camera once, then the main render kernel traces rays.
-- **Thin‑lens DOF**: `random_in_unit_disk` samples the aperture; `lower_left_corner`, `horizontal`, and `vertical` are scaled by the **focus distance**; `lens_radius = aperture/2`.
+- **Thin-lens DOF**: `random_in_unit_disk` samples the aperture; `lower_left_corner`, `horizontal`, and `vertical` are scaled by the **focus distance**; `lens_radius = aperture/2`.
 
 ---
 
