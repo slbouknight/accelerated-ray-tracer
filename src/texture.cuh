@@ -74,3 +74,91 @@ class noise_texture : public texture
     private:
         float scale;
 };
+
+__host__ __device__ inline float smoothstep(float edge0, float edge1, float x) {
+    // Scale/bias x to 0..1 then use cubic Hermite (3t^2 - 2t^3)
+    float t = clamp01((x - edge0) / (edge1 - edge0));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+class noodle_texture : public texture {
+public:
+    __device__ noodle_texture(float stripes_k=3.0f, float wiggle_amp=3.0f,
+                              float wiggle_freq=0.6f, int oct=3,
+                              vec3 dir=vec3(0,0,1),
+                              vec3 noodle=vec3(0.92f,0.85f,0.65f),   // noodle color
+                              vec3 gap=vec3(0.35f,0.20f,0.10f))      // gaps/broth
+    : k(stripes_k), A(wiggle_amp), f(wiggle_freq), octaves(oct),
+      d(unit_vector(dir)), cN(noodle), cG(gap) {}
+
+    __device__ vec3 value(float, float, const vec3& p) const override {
+        float u = dot(p, d);                          // stripe axis (change d to rotate)
+        float wig = perlin::turb(p * f, octaves);     // smooth warping field
+        float stripes = fabsf(__sinf(k * u + A * wig));
+        float t = smoothstep(0.75f, 0.98f, stripes);  // thin bright strands
+        return (1.f - t) * cG + t * cN;
+    }
+private:
+    float k, A, f; int octaves; vec3 d, cN, cG;
+};
+
+
+// --- Green felt texture (subtle mottling, no rings) ---
+// Uses perlin::noise(vec3) and perlin::turb(vec3, int depth)
+// If your perlin::noise returns [-1,1], define FELT_PERLIN_IS_SIGNED.
+class felt_texture : public texture {
+public:
+    __device__ felt_texture(
+        const vec3& base      = vec3(0.06f, 0.36f, 0.18f), // billiards felt green
+        float mottling_scale  = 16.0f,                     // higher = finer grain
+        float mottling_amt    = 0.08f,                     // 0.0–0.2 subtle brightness variation
+        float fiber_scale     = 4.0f,                      // directional variation scale
+        float fiber_amt       = 0.03f                      // very slight
+    )
+    : base_col(base),
+      m_scale(mottling_scale), m_amt(mottling_amt),
+      f_scale(fiber_scale),    f_amt(fiber_amt) {}
+
+    __device__ vec3 value(float /*u*/, float /*v*/, const vec3& p) const override {
+        // --- isotropic fine mottling ---
+        float m = perlin::noise(p * m_scale);
+        #ifdef FELT_PERLIN_IS_SIGNED
+            // Map [-1,1] -> [0,1]
+            m = 0.5f * (m + 1.0f);
+        #endif
+
+        // --- faint directional fibers (along X), slightly perturbed by turbulence ---
+        // Keep this in [0,1] using sin()
+        float phase = p.x() * f_scale + 2.0f * perlin::turb(p * 0.5f, 2);
+        float fibers = 0.5f * (1.0f + __sinf(phase));
+
+        // Combine (keep subtle)
+        float gain = 1.0f + m_amt * (m - 0.5f) + f_amt * (fibers - 0.5f);
+
+        // Clamp to a sane range so the felt doesn’t blow out or go black
+        gain = fminf(fmaxf(gain, 0.7f), 1.2f);
+
+        return base_col * gain;
+    }
+
+private:
+    vec3  base_col;
+    float m_scale, m_amt;
+    float f_scale, f_amt;
+};
+
+// texture_uv_offset.cuh
+class uv_offset_texture : public texture {
+public:
+    __device__ uv_offset_texture(texture* base, float u_offset_turns, float v_offset = 0.f)
+        : base_(base), du(u_offset_turns), dv(v_offset) {}
+
+    __device__ vec3 value(float u, float v, const vec3& p) const override {
+        float uu = u + du;  uu -= floorf(uu);            // wrap to [0,1)
+        float vv = v + dv;  vv = fminf(fmaxf(vv,0.f),1.f); // (keep v clamped)
+        return base_->value(uu, vv, p);
+    }
+private:
+    texture* base_;
+    float du, dv; // du in “turns” (1.0 = 360°)
+};
