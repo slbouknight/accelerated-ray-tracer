@@ -5,7 +5,7 @@ quads, instancing, light sources, Cornell box, texture mapping, and the randomiz
 CUDA memory/launch patterns.
 
 <p align="left">
-  <img src="images/finalScene.png" alt="Demo" height="800"/>
+  <img src="images/alfredo2.png" alt="Demo" height="800"/>
 </p>
 
 > References  
@@ -54,15 +54,15 @@ CUDA memory/launch patterns.
 - **Shutter interval sampling**: each ray carries a randomized time in `[time0, time1]`
 - **Animated primitives**: object positions are interpolated across the shutter window
 - Produces natural blur trails when geometry moves during exposure
-  <p align="left">
-      <img src="images/checkeredBounce.png" alt="Motion blur" width="600"/>
-  </p>
+<p align="left">
+    <img src="images/utk.png" alt="Motion blur" width="400"/>
+</p>
 
 ### Light Sources
 - **Emissive materials** for area lights
 - Example: Cornell box ceiling quad + glowing sphere  
 <p align="left">
-  <img src="images/simpleLight.png" alt="Simple Light" width="400"/>
+  <img src="images/poolBall.png" alt="Simple Light" width="400"/>
 </p>
 
 ### Quads & Rectangular Geometry
@@ -76,7 +76,7 @@ CUDA memory/launch patterns.
 - Translate / rotate geometry without duplicating vertex data
 - Used to place rotated blocks in the Cornell Box  
 <p align="left">
-  <img src="images/instancing.png" alt="Instancing" width="400"/>
+  <img src="images/redBlue.png" alt="Instancing" width="400"/>
 </p>
 
 ### Texture Mapping
