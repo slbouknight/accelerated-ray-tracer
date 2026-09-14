@@ -1,0 +1,6 @@
+# Golden reference images are binary PPM (P6). Without this, git's CRLF
+# conversion on Windows rewrites every 0x0A byte in the pixel data and silently
+# corrupts the references.
+*.ppm binary
+*.png binary
+*.jpg binary

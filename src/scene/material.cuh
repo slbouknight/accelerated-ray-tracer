@@ -1,10 +1,11 @@
 // material.cuh  (no front_face needed)
 #pragma once
 #include <curand_kernel.h>
-#include "ray.cuh"
-#include "hittable.cuh"    // hit_record with p, normal, u, v (no front_face required)
+#include "../core/ray.hpp"
+#include "../core/primitives.hpp"   // Hit
 #include "texture.cuh"     // solid_color, checker_texture, image_texture
-#include "vec3.cuh"
+#include "../core/shading_math.hpp"   // reflect / refract / schlick
+#include "../core/vec3.hpp"
 
 // -------- helpers (same spirit as your current code) ----------
 __device__ inline float randf(curandState* st) { return curand_uniform(st); }
@@ -17,31 +18,6 @@ __device__ inline vec3 random_in_unit_sphere(curandState* st)
     }
 }
 
-__device__ inline vec3 reflect(const vec3& v, const vec3& n) 
-{
-    return v - 2.0f * dot(v, n) * n;
-}
-
-// your original style refract (no front_face required)
-__device__ inline bool refract(const vec3& v, const vec3& n, float ni_over_nt, vec3& refracted) 
-{
-    vec3 uv = unit_vector(v);
-    float dt = dot(uv, n);
-    float disc = 1.0f - ni_over_nt*ni_over_nt*(1.0f - dt*dt);
-    if (disc > 0.0f) {
-        refracted = ni_over_nt * (uv - n*dt) - n * sqrtf(disc);
-        return true;
-    }
-    return false;
-}
-
-__device__ inline float schlick(float cosine, float ref_idx) 
-{
-    float r0 = (1.0f - ref_idx) / (1.0f + ref_idx);
-    r0 = r0 * r0;
-    return r0 + (1.0f - r0) * powf(1.0f - cosine, 5.0f);
-}
-
 // ---------------- base material ----------------
 class material 
 {
@@ -52,7 +28,7 @@ public:
         return vec3(0.f, 0.f, 0.f);
     }
     __device__ virtual bool scatter(
-        const ray& r_in, const hit_record& rec,
+        const ray& r_in, const Hit& rec,
         vec3& attenuation, ray& scattered,
         curandState* rng
     ) const = 0;
@@ -61,19 +37,21 @@ public:
 // ---------------- lambertian (now texture-backed) ----------------
 class lambertian : public material {
 public:
-    texture* tex; // not owning
-    __device__ ~lambertian() override { if (tex) delete tex; }
+    texture* tex;
+    bool owns_tex;
+    __device__ ~lambertian() override { if (owns_tex && tex) delete tex; }
 
     // convenience ctor: solid color
     __device__ lambertian(const vec3& albedo)
-        : tex(new solid_color(albedo)) {}
+        : tex(new solid_color(albedo)), owns_tex(true) {}
 
-    // texture-backed ctor
-    __device__ lambertian(texture* t)
-        : tex(t) {}
+    // texture-backed ctor. owns=false when the texture lives in a table that
+    // frees it independently.
+    __device__ lambertian(texture* t, bool owns = true)
+        : tex(t), owns_tex(owns) {}
 
     __device__ bool scatter(
-        const ray& r_in, const hit_record& rec,
+        const ray& r_in, const Hit& rec,
         vec3& attenuation, ray& scattered,
         curandState* rng
     ) const override 
@@ -97,7 +75,7 @@ public:
         : albedo(a), fuzz(f < 1.0f ? f : 1.0f) {}
 
     __device__ bool scatter(
-        const ray& r_in, const hit_record& rec,
+        const ray& r_in, const Hit& rec,
         vec3& attenuation, ray& scattered,
         curandState* rng
     ) const override 
@@ -117,7 +95,7 @@ public:
     __device__ dielectric(float ri) : ref_idx(ri) {}
 
     __device__ bool scatter(
-        const ray& r_in, const hit_record& rec,
+        const ray& r_in, const Hit& rec,
         vec3& attenuation, ray& scattered,
         curandState* rng
     ) const override 
@@ -162,9 +140,9 @@ public:
 class diffuse_light : public material 
 {
 public:
-    __device__ diffuse_light(texture* t) : tex(t) {}
-    __device__ diffuse_light(const vec3& c) : tex(nullptr), solid(c) {}
-    __device__ ~diffuse_light() override { if (tex) delete tex; }
+    __device__ diffuse_light(texture* t, bool owns = true) : tex(t), owns_tex(owns) {}
+    __device__ diffuse_light(const vec3& c) : tex(nullptr), solid(c), owns_tex(false) {}
+    __device__ ~diffuse_light() override { if (owns_tex && tex) delete tex; }
 
     __device__ vec3 emitted(float u, float v, const vec3& p) const override 
     {
@@ -172,7 +150,7 @@ public:
     }
 
     // lights don’t scatter
-    __device__ bool scatter(const ray&, const hit_record&, vec3&, ray&, curandState*) const override 
+    __device__ bool scatter(const ray&, const Hit&, vec3&, ray&, curandState*) const override 
     {
         return false;
     }
@@ -180,17 +158,19 @@ public:
 private:
     texture* tex;     // optional
     vec3     solid;   // used if tex == nullptr
+    bool     owns_tex;
 };
 
 class isotropic : public material 
 {
 public:
-    texture* tex; // owns
-    __device__ isotropic(texture* t) : tex(t) {}
-    __device__ isotropic(const vec3& c) : tex(new solid_color(c)) {}
-    __device__ ~isotropic() override { if (tex) delete tex; }
+    texture* tex;
+    bool owns_tex;
+    __device__ isotropic(texture* t, bool owns = true) : tex(t), owns_tex(owns) {}
+    __device__ isotropic(const vec3& c) : tex(new solid_color(c)), owns_tex(true) {}
+    __device__ ~isotropic() override { if (owns_tex && tex) delete tex; }
 
-    __device__ bool scatter(const ray& r_in, const hit_record& rec,
+    __device__ bool scatter(const ray& r_in, const Hit& rec,
                             vec3& attenuation, ray& scattered,
                             curandState* rng) const override {
         // Sample random direction uniformly over the sphere
