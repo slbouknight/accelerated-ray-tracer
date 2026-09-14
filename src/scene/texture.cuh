@@ -26,12 +26,17 @@ class checker_texture : public texture
 {
     public:
         float inv_scale = 1.f;
-        texture* even = nullptr; 
+        texture* even = nullptr;
         texture* odd = nullptr;
+        bool owns_children = true;
         __device__ checker_texture() {}
-        __device__ checker_texture(float scale, texture* e, texture* o)
-            : inv_scale(1.f/scale), even(e), odd(o) {}
-        __device__ ~checker_texture() override { delete even; delete odd; }
+        // owns=false when the caller keeps the children in its own table and
+        // frees them itself, which is how the material table works.
+        __device__ checker_texture(float scale, texture* e, texture* o, bool owns = true)
+            : inv_scale(1.f/scale), even(e), odd(o), owns_children(owns) {}
+        __device__ ~checker_texture() override {
+            if (owns_children) { delete even; delete odd; }
+        }
         __device__ vec3 value(float u, float v, const vec3& p) const override 
         {
             int xi = int(floorf(inv_scale*p.x()));

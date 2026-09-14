@@ -168,8 +168,8 @@ switch ($Command) {
             $Exe, '--scene', $Scene, '--width', '64', '--height', '64',
             '--spp', '4', '--quiet', '--out', (Join-Path $ExeDir 'sanitize.ppm')) 'compute-sanitizer'
         Write-Host ''
-        Write-Host 'Expected: 0 invalid accesses. Leaks are known (instancing wrappers do' -ForegroundColor DarkGray
-        Write-Host 'not own their children; shared materials are deliberately non-owning).' -ForegroundColor DarkGray
+        Write-Host 'Expected: 0 errors, 0 bytes leaked. Geometry is POD in flat arrays and' -ForegroundColor DarkGray
+        Write-Host 'every material is owned by exactly one table, so there is nothing to leak.' -ForegroundColor DarkGray
     }
 
     'profile' {

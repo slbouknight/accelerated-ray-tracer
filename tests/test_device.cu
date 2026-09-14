@@ -1,15 +1,19 @@
-// Device-side unit tests: geometry, traversal, materials and the camera.
+// Device-side tests: materials, textures, and the material table.
 //
-// Everything under test here is locked behind __device__ virtual dispatch and
-// device-heap allocation, so it cannot be exercised from the host. The pattern
-// is therefore: a single-thread kernel computes, writes primitive floats into a
-// managed buffer, and the host asserts on them with the same harness used by
-// test_math.cu. Keeping all assertions host-side means failures print real
-// values and line numbers instead of a device-side trap.
+// This file used to cover geometry, instancing, BVH traversal and the camera as
+// well -- all of which needed a GPU because they were `__device__` virtuals
+// built with device `new`. Those are now POD and live in test_geometry.cpp,
+// which runs on the host.
 //
-// After the flat/tagged-dispatch refactor most of these should migrate into
-// test_math.cu and stop needing a GPU at all. Until then, the same expected
-// values apply, which is what makes them a usable refactor harness.
+// What is left is genuinely device-only: materials and textures are still a
+// virtual hierarchy, and a vtable pointer is a device address, so they can only
+// be constructed and called on the device. Shading is also where the book's
+// class structure earns its keep and there are tens of them per scene rather
+// than thousands, so the indirect call is not on the critical path.
+//
+// Pattern: a single-thread kernel computes and writes primitive floats into a
+// managed buffer; the host asserts on them with the same harness as the host
+// tests, so a failure prints real values and a line number instead of a trap.
 
 #include "test_harness.h"
 
@@ -17,28 +21,22 @@
 #include <curand_kernel.h>
 #include <cfloat>
 
-#include "../src/scene/bvh.cuh"
-#include "../src/scene/camera.cuh"
-#include "../src/scene/hittable.cuh"
-#include "../src/scene/material.cuh"
-#include "../src/scene/quad.cuh"
-#include "../src/scene/sphere.cuh"
-#include "../src/scene/texture.cuh"
-#include "../src/core/hash_rng.hpp"
+#include "../src/core/primitives.hpp"
 #include "../src/core/vec3.hpp"
+#include "../src/host/material_desc.hpp"
+#include "../src/scene/material.cuh"
+#include "../src/scene/material_table.cuh"
+#include "../src/scene/texture.cuh"
 
 namespace {
 
 constexpr float kEps = 1e-4f;
-constexpr float kMiss = -1.0f;   // sentinel written when a hit() returns false
 
-// ---------------------------------------------------------------------------
-// Managed scratch buffer. Prefilled with NaN so a kernel that silently fails to
-// write a slot produces a failing assertion instead of reading a stale zero.
-// ---------------------------------------------------------------------------
+// Managed scratch, prefilled with NaN so a slot the kernel forgets to write
+// produces a failing assertion rather than a stale zero that looks plausible.
 class Scratch {
 public:
-    explicit Scratch(int n) : n_(n) {
+    explicit Scratch(int n) {
         if (cudaMallocManaged(&d_, sizeof(float) * n) != cudaSuccess) d_ = nullptr;
         if (d_) for (int i = 0; i < n; ++i) d_[i] = NAN;
     }
@@ -46,19 +44,15 @@ public:
     Scratch(const Scratch&) = delete;
     Scratch& operator=(const Scratch&) = delete;
 
-    float*  data() const { return d_; }
-    bool    ok()   const { return d_ != nullptr; }
-    float   operator[](int i) const { return d_[i]; }
-    // Read three consecutive slots as a vector, for RT_CHECK_VEC.
-    vec3    v(int i) const { return vec3(d_[i], d_[i + 1], d_[i + 2]); }
+    float* data() const { return d_; }
+    bool   ok()   const { return d_ != nullptr; }
+    float  operator[](int i) const { return d_[i]; }
+    vec3   v(int i) const { return vec3(d_[i], d_[i + 1], d_[i + 2]); }
 
 private:
     float* d_ = nullptr;
-    int    n_;
 };
 
-// Launch errors and device-side traps both surface here rather than as a
-// confusing assertion failure three tests later.
 bool device_ok(std::string* err) {
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
@@ -76,444 +70,33 @@ bool device_ok(std::string* err) {
 } // namespace
 
 // =============================================================================
-// sphere
+// Materials
 // =============================================================================
 
-// out: [0]=hit [1]=t [2..4]=p [5..7]=normal [8]=u [9]=v
-__global__ void k_sphere_basic(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    sphere s(vec3(0, 0, 0), 1.0f, &mat, /*owns=*/false);
-
-    hit_record rec;
-    const ray r(vec3(0, 0, -5), vec3(0, 0, 1), 0.0);
-    const bool h = s.hit(r, 0.001f, FLT_MAX, rec);
-
-    out[0] = h ? 1.0f : 0.0f;
-    if (!h) return;
-    out[1] = rec.t;
-    out[2] = rec.p.x();      out[3] = rec.p.y();      out[4] = rec.p.z();
-    out[5] = rec.normal.x(); out[6] = rec.normal.y(); out[7] = rec.normal.z();
-    out[8] = (float)rec.u;   out[9] = (float)rec.v;
-}
-
-TEST(sphere, hit_from_outside_takes_near_root) {
-    Scratch s(10);
-    RT_REQUIRE(s.ok());
-    k_sphere_basic<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_NEAR(s[0], 1.0f, 0.0f);                  // hit
-    RT_CHECK_NEAR(s[1], 4.0f, kEps);                  // near root, not t=6
-    RT_CHECK_VEC(s.v(2), 0.0f, 0.0f, -1.0f, kEps);    // front of the sphere
-    RT_CHECK_VEC(s.v(5), 0.0f, 0.0f, -1.0f, kEps);    // outward unit normal
-    RT_CHECK_NEAR(s[8], 0.75f, 1e-4f);                // matches host sphere_uv test
-    RT_CHECK_NEAR(s[9], 0.50f, 1e-4f);
-}
-
-// out: [0]=miss ray  [1]=tangent-ish miss  [2]=tmax too small  [3]=tmin too large
-//      [4]=hit from inside  [5]=t from inside
-__global__ void k_sphere_rejects(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    sphere s(vec3(0, 0, 0), 1.0f, &mat, false);
-    hit_record rec;
-
-    out[0] = s.hit(ray(vec3(0, 5, -5), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec) ? 1.f : 0.f;
-    out[1] = s.hit(ray(vec3(0, 0, -5), vec3(0, 0, -1), 0.0), 0.001f, FLT_MAX, rec) ? 1.f : 0.f;
-    out[2] = s.hit(ray(vec3(0, 0, -5), vec3(0, 0, 1), 0.0), 0.001f, 3.0f, rec) ? 1.f : 0.f;
-    out[3] = s.hit(ray(vec3(0, 0, -5), vec3(0, 0, 1), 0.0), 7.0f, FLT_MAX, rec) ? 1.f : 0.f;
-
-    // Origin inside the sphere: the near root is negative, so hit() must fall
-    // through to the far root rather than reporting a miss.
-    const bool inside = s.hit(ray(vec3(0, 0, 0), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[4] = inside ? 1.f : 0.f;
-    out[5] = inside ? rec.t : kMiss;
-}
-
-TEST(sphere, rejection_cases_and_hit_from_inside) {
-    Scratch s(6);
-    RT_REQUIRE(s.ok());
-    k_sphere_rejects<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_NEAR(s[0], 0.0f, 0.0f);      // passes 5 units above the sphere
-    RT_CHECK_NEAR(s[1], 0.0f, 0.0f);      // pointing away
-    RT_CHECK_NEAR(s[2], 0.0f, 0.0f);      // t_max clips before t=4
-    RT_CHECK_NEAR(s[3], 0.0f, 0.0f);      // t_min clips past t=6
-    RT_CHECK_NEAR(s[4], 1.0f, 0.0f);
-    RT_CHECK_NEAR(s[5], 1.0f, kEps);      // far root
-}
-
-// out: [0..2]=hit p at time 0   [3..5]=hit p at time 1   [6..8]=bbox min  [9..11]=bbox max
-__global__ void k_sphere_moving(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    // Centre travels from (0,0,0) to (4,0,0) across the shutter interval.
-    sphere s(vec3(0, 0, 0), vec3(4, 0, 0), 1.0f, &mat);
-
-    hit_record rec;
-    if (s.hit(ray(vec3(0, 0, -5), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec)) {
-        out[0] = rec.p.x(); out[1] = rec.p.y(); out[2] = rec.p.z();
-    }
-    if (s.hit(ray(vec3(4, 0, -5), vec3(0, 0, 1), 1.0), 0.001f, FLT_MAX, rec)) {
-        out[3] = rec.p.x(); out[4] = rec.p.y(); out[5] = rec.p.z();
-    }
-    const aabb b = s.bounding_box();
-    out[6] = b.min().x();  out[7] = b.min().y();  out[8]  = b.min().z();
-    out[9] = b.max().x();  out[10] = b.max().y(); out[11] = b.max().z();
-}
-
-TEST(sphere, moving_centre_is_sampled_at_ray_time) {
-    Scratch s(12);
-    RT_REQUIRE(s.ok());
-    k_sphere_moving<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_VEC(s.v(0), 0.0f, 0.0f, -1.0f, kEps);   // shutter open: centre at x=0
-    RT_CHECK_VEC(s.v(3), 4.0f, 0.0f, -1.0f, kEps);   // shutter close: centre at x=4
-
-    // The motion-blur bbox must span the whole swept path, or the BVH will cull
-    // the sphere out of frames where it is genuinely visible.
-    RT_CHECK_VEC(s.v(6), -1.0f, -1.0f, -1.0f, kEps);
-    RT_CHECK_VEC(s.v(9), 5.0f, 1.0f, 1.0f, kEps);
-}
-
-// out: [0..2]=bbox min  [3..5]=bbox max  [6]=hit  [7]=t
-__global__ void k_sphere_negative_radius(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    // The hollow-glass-bubble trick from the Cornell scene: a negative radius
-    // inverts the surface normal without changing the geometry.
-    sphere s(vec3(10, 0, 0), -2.0f, &mat, false);
-
-    const aabb b = s.bounding_box();
-    out[0] = b.min().x(); out[1] = b.min().y(); out[2] = b.min().z();
-    out[3] = b.max().x(); out[4] = b.max().y(); out[5] = b.max().z();
-
-    hit_record rec;
-    const bool h = s.hit(ray(vec3(10, 0, -5), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[6] = h ? 1.f : 0.f;
-    out[7] = h ? rec.t : kMiss;
-}
-
-TEST(sphere, negative_radius_still_produces_a_valid_bbox) {
-    Scratch s(8);
-    RT_REQUIRE(s.ok());
-    k_sphere_negative_radius<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    // sphere's ctor computes aabb(cen - rvec, cen + rvec) with a negative rvec,
-    // which would invert the box -- except aabb's ctor re-normalizes via
-    // fminf/fmaxf. Correct, but only by way of the aabb ctor, so it is worth
-    // pinning: an aabb "optimization" that drops the min/max would break this.
-    RT_CHECK_VEC(s.v(0), 8.0f, -2.0f, -2.0f, kEps);
-    RT_CHECK_VEC(s.v(3), 12.0f, 2.0f, 2.0f, kEps);
-    RT_CHECK_NEAR(s[6], 1.0f, 0.0f);
-    RT_CHECK_NEAR(s[7], 3.0f, kEps);
-}
-
-// =============================================================================
-// quad
-// =============================================================================
-
-// out: [0]=hit centre [1]=t [2..4]=p [5..7]=normal [8]=u [9]=v
-//      [10]=miss outside  [11]=miss parallel  [12..14]=inward normal
-__global__ void k_quad(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    // Unit quad in the z=0 plane spanning x,y in [0,1].
-    quad q(vec3(0, 0, 0), vec3(1, 0, 0), vec3(0, 1, 0), &mat, /*inward=*/false, /*owns=*/false);
-
-    hit_record rec;
-    const bool h = q.hit(ray(vec3(0.5f, 0.5f, -3), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[0] = h ? 1.f : 0.f;
-    if (h) {
-        out[1] = rec.t;
-        out[2] = rec.p.x();      out[3] = rec.p.y();      out[4] = rec.p.z();
-        out[5] = rec.normal.x(); out[6] = rec.normal.y(); out[7] = rec.normal.z();
-        out[8] = (float)rec.u;   out[9] = (float)rec.v;
-    }
-
-    // Outside the (alpha,beta) unit square: the plane is hit but the quad isn't.
-    out[10] = q.hit(ray(vec3(1.5f, 0.5f, -3), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec) ? 1.f : 0.f;
-    // Travelling parallel to the plane: denom ~ 0, must not divide by zero.
-    out[11] = q.hit(ray(vec3(0.5f, 0.5f, -3), vec3(1, 0, 0), 0.0), 0.001f, FLT_MAX, rec) ? 1.f : 0.f;
-
-    // inward=true flips the stored geometric normal (Cornell walls rely on it).
-    quad qi(vec3(0, 0, 0), vec3(1, 0, 0), vec3(0, 1, 0), &mat, /*inward=*/true, false);
-    out[12] = qi.normal.x(); out[13] = qi.normal.y(); out[14] = qi.normal.z();
-}
-
-TEST(quad, hit_interior_miss_exterior_and_parallel) {
-    Scratch s(15);
-    RT_REQUIRE(s.ok());
-    k_quad<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_NEAR(s[0], 1.0f, 0.0f);
-    RT_CHECK_NEAR(s[1], 3.0f, kEps);
-    RT_CHECK_VEC(s.v(2), 0.5f, 0.5f, 0.0f, kEps);
-    // cross(u,v) = +z, but the shading normal is flipped to oppose the ray.
-    RT_CHECK_VEC(s.v(5), 0.0f, 0.0f, -1.0f, kEps);
-    RT_CHECK_NEAR(s[8], 0.5f, kEps);       // alpha
-    RT_CHECK_NEAR(s[9], 0.5f, kEps);       // beta
-
-    RT_CHECK_NEAR(s[10], 0.0f, 0.0f);
-    RT_CHECK_NEAR(s[11], 0.0f, 0.0f);
-    RT_CHECK_VEC(s.v(12), 0.0f, 0.0f, -1.0f, kEps);
-}
-
-// out: [0]=hit [1]=t [2..4]=p [5..7]=normal  [8..10]=bbox min  [11..13]=bbox max
-__global__ void k_box(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    hittable* b = make_box(vec3(-1, -1, -1), vec3(1, 1, 1), &mat);
-
-    hit_record rec;
-    const bool h = b->hit(ray(vec3(0, 0, -5), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[0] = h ? 1.f : 0.f;
-    if (h) {
-        out[1] = rec.t;
-        out[2] = rec.p.x();      out[3] = rec.p.y();      out[4] = rec.p.z();
-        out[5] = rec.normal.x(); out[6] = rec.normal.y(); out[7] = rec.normal.z();
-    }
-    const aabb bb = b->bounding_box();
-    out[8]  = bb.min().x(); out[9]  = bb.min().y(); out[10] = bb.min().z();
-    out[11] = bb.max().x(); out[12] = bb.max().y(); out[13] = bb.max().z();
-
-    delete b;
-}
-
-TEST(box, closest_face_wins) {
-    Scratch s(14);
-    RT_REQUIRE(s.ok());
-    k_box<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_NEAR(s[0], 1.0f, 0.0f);
-    // compound6 scans all six faces; it must report the -z face at t=4, not the
-    // +z face at t=6 that it also intersects.
-    RT_CHECK_NEAR(s[1], 4.0f, kEps);
-    RT_CHECK_VEC(s.v(2), 0.0f, 0.0f, -1.0f, kEps);
-    RT_CHECK_VEC(s.v(5), 0.0f, 0.0f, -1.0f, kEps);
-
-    // quad::set_bounding_box pads by 1e-3 to avoid zero-thickness slabs.
-    RT_CHECK_NEAR(s[8],  -1.0f, 2e-3f);
-    RT_CHECK_NEAR(s[11],  1.0f, 2e-3f);
-}
-
-// =============================================================================
-// instancing (translate / rotate_y)
-// =============================================================================
-
-// out: [0]=hit [1]=t [2..4]=p   then rotate: [5]=hit [6]=t [7..9]=p
-__global__ void k_instances(float* out) {
-    lambertian mat(vec3(0.5f, 0.5f, 0.5f));
-    hit_record rec;
-
-    // Sphere at the origin, translated to (10,0,0). A ray aimed at x=10 must
-    // hit, and the returned point must be back in *world* space.
-    sphere* base = new sphere(vec3(0, 0, 0), 1.0f, &mat, false);
-    translate* t = new translate(base, vec3(10, 0, 0));
-    const bool h1 = t->hit(ray(vec3(10, 0, -5), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[0] = h1 ? 1.f : 0.f;
-    if (h1) { out[1] = rec.t; out[2] = rec.p.x(); out[3] = rec.p.y(); out[4] = rec.p.z(); }
-
-    // A unit sphere offset to +x=3, rotated 90 degrees about Y, lands on the
-    // -z axis (R_y(90) maps +x to -z under this convention).
-    sphere* off = new sphere(vec3(3, 0, 0), 1.0f, &mat, false);
-    rotate_y* rot = new rotate_y(off, 90.0f);
-    const bool h2 = rot->hit(ray(vec3(0, 0, -8), vec3(0, 0, 1), 0.0), 0.001f, FLT_MAX, rec);
-    out[5] = h2 ? 1.f : 0.f;
-    if (h2) { out[6] = rec.t; out[7] = rec.p.x(); out[8] = rec.p.y(); out[9] = rec.p.z(); }
-
-    // translate/rotate_y do not own their children, so free explicitly.
-    delete t; delete base;
-    delete rot; delete off;
-}
-
-TEST(instancing, translate_and_rotate_y_return_world_space_hits) {
-    Scratch s(10);
-    RT_REQUIRE(s.ok());
-    k_instances<<<1, 1>>>(s.data());
-    RT_SYNC();
-
-    RT_CHECK_NEAR(s[0], 1.0f, 0.0f);
-    RT_CHECK_NEAR(s[1], 4.0f, kEps);
-    RT_CHECK_VEC(s.v(2), 10.0f, 0.0f, -1.0f, kEps);   // world space, not (0,0,-1)
-
-    RT_CHECK_NEAR(s[5], 1.0f, 0.0f);
-    RT_CHECK_NEAR(s[6], 4.0f, kEps);
-    RT_CHECK_VEC(s.v(7), 0.0f, 0.0f, -4.0f, kEps);
-}
-
-// =============================================================================
-// BVH -- the refactor harness
-// =============================================================================
-
-namespace {
-constexpr int kBvhObjects = 96;
-constexpr int kBvhRays    = 256;
-} // namespace
-
-// Probe rays are generated from a shared helper so the brute-force pass and the
-// BVH pass cannot drift apart. Each starts well outside the scene and is aimed
-// at a random point inside it, which keeps the hit rate high enough that the
-// comparison is actually exercising traversal.
-__device__ inline ray probe_ray(int k) {
-    const vec3 dir_seed = random_in_unit_cube(k + 100000) * 2.0f - vec3(1, 1, 1);
-    const vec3 origin   = unit_vector(dir_seed) * 15.0f;
-    const vec3 target   = random_in_unit_cube(k + 200000) * 8.0f - vec3(4, 4, 4);
-    return ray(origin, unit_vector(target - origin), 0.0);
-}
-
-// For each ray, writes the brute-force closest t and the BVH closest t.
-// out[2k] = linear scan, out[2k+1] = BVH. kMiss when nothing was hit.
-__global__ void k_bvh_vs_bruteforce(float* out, int nobj, int nray) {
-    lambertian* mat = new lambertian(vec3(0.5f, 0.5f, 0.5f));
-
-    hittable** list = (hittable**)malloc(sizeof(hittable*) * nobj);
-    hittable** flat = (hittable**)malloc(sizeof(hittable*) * nobj);
-    if (!list || !flat) { out[0] = -999.0f; return; }
-
-    for (int i = 0; i < nobj; ++i) {
-        // Deterministic scatter in [-4,4]^3 with varied radii, so the tree has
-        // a real branching structure rather than a degenerate chain.
-        const vec3 u = random_in_unit_cube(i);
-        const vec3 c = u * 8.0f - vec3(4, 4, 4);
-        const float rad = 0.15f + 0.45f * random_in_unit_cube(i + 7919).x();
-        list[i] = new sphere(c, rad, mat, /*owns=*/false);
-        flat[i] = list[i];   // keep an unpermuted copy; the BVH sorts in place
-    }
-
-    // Reference answer first, from a plain linear scan over every object.
-    for (int k = 0; k < nray; ++k) {
-        const ray r = probe_ray(k);
-
-        float closest = FLT_MAX;
-        bool  any = false;
-        hit_record rec;
-        for (int i = 0; i < nobj; ++i) {
-            if (flat[i]->hit(r, 0.001f, closest, rec)) { any = true; closest = rec.t; }
-        }
-        out[2 * k] = any ? closest : kMiss;
-    }
-
-    bvh_node* root = new bvh_node(list, 0, nobj);
-
-    for (int k = 0; k < nray; ++k) {
-        hit_record rec;
-        out[2 * k + 1] = root->hit(probe_ray(k), 0.001f, FLT_MAX, rec) ? rec.t : kMiss;
-    }
-
-    delete root;                                  // internal nodes only
-    for (int i = 0; i < nobj; ++i) delete flat[i];
-    delete mat;
-    free(list); free(flat);
-}
-
-TEST(bvh, traversal_agrees_with_brute_force) {
-    // This is the single most valuable test in the suite. A BVH is an
-    // acceleration structure: it is only allowed to make the *same* answer
-    // arrive faster. Any rewrite -- iterative traversal, SAH splits, flattened
-    // nodes, host-side construction -- has to keep this green.
-    Scratch s(2 * kBvhRays);
-    RT_REQUIRE(s.ok());
-    k_bvh_vs_bruteforce<<<1, 1>>>(s.data(), kBvhObjects, kBvhRays);
-    RT_SYNC();
-
-    RT_REQUIRE(s[0] > -900.0f);   // device malloc succeeded
-
-    int mismatches = 0, hits = 0;
-    for (int k = 0; k < kBvhRays; ++k) {
-        const float bf = s[2 * k], bvh = s[2 * k + 1];
-        const bool bf_hit = bf > 0.0f, bvh_hit = bvh > 0.0f;
-        if (bf_hit) ++hits;
-
-        if (bf_hit != bvh_hit) {
-            if (++mismatches <= 5) {
-                RT_FAIL("ray " + std::to_string(k) + ": hit disagreement (linear="
-                        + (bf_hit ? "hit" : "miss") + ", bvh="
-                        + (bvh_hit ? "hit" : "miss") + ")");
-            }
-        } else if (bf_hit && !rt_test::near_rel(bf, bvh, 1e-5)) {
-            if (++mismatches <= 5) {
-                RT_FAIL("ray " + std::to_string(k) + ": t disagreement (linear="
-                        + rt_test::fmt(bf) + ", bvh=" + rt_test::fmt(bvh) + ")");
-            }
-        }
-    }
-
-    RT_CHECK_EQ(mismatches, 0);
-    // Guard against the test passing trivially because every ray missed.
-    RT_CHECK(hits > kBvhRays / 8);
-}
-
-// out: [0..2] = bbox min, [3..5] = bbox max, [6] = objects enclosed
-__global__ void k_bvh_bbox(float* out, int nobj) {
-    lambertian* mat = new lambertian(vec3(0.5f, 0.5f, 0.5f));
-    hittable** list = (hittable**)malloc(sizeof(hittable*) * nobj);
-    if (!list) { out[6] = -999.0f; return; }
-
-    aabb expect;
-    for (int i = 0; i < nobj; ++i) {
-        const vec3 c = random_in_unit_cube(i) * 8.0f - vec3(4, 4, 4);
-        const float rad = 0.15f + 0.45f * random_in_unit_cube(i + 7919).x();
-        list[i] = new sphere(c, rad, mat, false);
-        expect = aabb::surrounding_box(expect, list[i]->bounding_box());
-    }
-
-    bvh_node* root = new bvh_node(list, 0, nobj);
-    const aabb got = root->bounding_box();
-
-    // Report the *difference* from the true union so the host sees zeros on success.
-    out[0] = got.min().x() - expect.min().x();
-    out[1] = got.min().y() - expect.min().y();
-    out[2] = got.min().z() - expect.min().z();
-    out[3] = got.max().x() - expect.max().x();
-    out[4] = got.max().y() - expect.max().y();
-    out[5] = got.max().z() - expect.max().z();
-    out[6] = (float)nobj;
-
-    delete root;
-    for (int i = 0; i < nobj; ++i) delete list[i];
-    delete mat;
-    free(list);
-}
-
-TEST(bvh, root_box_is_exactly_the_union_of_its_leaves) {
-    Scratch s(7);
-    RT_REQUIRE(s.ok());
-    k_bvh_bbox<<<1, 1>>>(s.data(), kBvhObjects);
-    RT_SYNC();
-
-    RT_REQUIRE(s[6] > 0.0f);
-    // A root box that is too small silently culls geometry; too large only
-    // costs traversal time. Demand exactness -- it is cheap to maintain.
-    for (int i = 0; i < 6; ++i) RT_CHECK_NEAR(s[i], 0.0f, 1e-5f);
-}
-
-// =============================================================================
-// materials
-// =============================================================================
-
-// out: [0]=scattered? [1..3]=dir [4..6]=attenuation [7]=dielectric scattered?
-//      [8..10]=dielectric attenuation  [11]=light scatters?  [12..14]=emitted
+// out: [0]=scattered? [1..3]=unit dir [4..6]=attenuation
+//      [7]=dielectric scattered? [8..10]=dielectric attenuation
+//      [11]=light scatters? [12..14]=emitted
 __global__ void k_materials(float* out) {
     curandState rng;
     curand_init(7u, 0, 0, &rng);
 
-    hit_record rec;
+    Hit rec;
     rec.p = vec3(0, 0, 0);
     rec.normal = vec3(0, 1, 0);
-    rec.u = rec.v = 0.0;
+    rec.u = rec.v = 0.0f;
+    rec.mat = 0;
 
-    // Zero-fuzz metal is a perfect mirror: a 45-degree incoming ray leaves at
-    // 45 degrees with the tangential component preserved.
+    // Zero-fuzz metal is a perfect mirror: 45 degrees in, 45 out, with the
+    // tangential component preserved.
     metal m(vec3(0.8f, 0.6f, 0.2f), 0.0f);
     ray scattered; vec3 atten;
-    const ray incoming(vec3(-1, 1, 0), unit_vector(vec3(1, -1, 0)), 0.0);
+    const ray incoming(vec3(-1, 1, 0), unit_vector(vec3(1, -1, 0)), 0.0f);
     out[0] = m.scatter(incoming, rec, atten, scattered, &rng) ? 1.f : 0.f;
     const vec3 d = unit_vector(scattered.direction());
     out[1] = d.x(); out[2] = d.y(); out[3] = d.z();
     out[4] = atten.x(); out[5] = atten.y(); out[6] = atten.z();
 
-    // Glass never absorbs: attenuation is always white whichever branch it takes.
+    // Glass never absorbs: white attenuation whichever branch it takes.
     dielectric g(1.5f);
     vec3 gatten;
     out[7] = g.scatter(incoming, rec, gatten, scattered, &rng) ? 1.f : 0.f;
@@ -534,7 +117,7 @@ TEST(material, metal_mirrors_dielectric_is_white_light_terminates) {
     RT_SYNC();
 
     RT_CHECK_NEAR(s[0], 1.0f, 0.0f);
-    RT_CHECK_VEC(s.v(1), 0.70710678f, 0.70710678f, 0.0f, 1e-4f);
+    RT_CHECK_VEC(s.v(1), 0.70710678f, 0.70710678f, 0.0f, kEps);
     RT_CHECK_VEC(s.v(4), 0.8f, 0.6f, 0.2f, kEps);
 
     RT_CHECK_NEAR(s[7], 1.0f, 0.0f);
@@ -544,30 +127,84 @@ TEST(material, metal_mirrors_dielectric_is_white_light_terminates) {
     RT_CHECK_VEC(s.v(12), 4.0f, 5.0f, 6.0f, kEps);
 }
 
-// out: [0..2]=even cell, [3..5]=odd cell, [6..8]=solid, [9..11]=uv_offset wrap
+// out: [0]=scattered? [1..3]=attenuation [4]=direction length <= 1?
+//      [5]=scatter origin matches hit point?
+__global__ void k_lambertian_and_isotropic(float* out) {
+    curandState rng;
+    curand_init(3u, 0, 0, &rng);
+
+    Hit rec;
+    rec.p = vec3(2, 3, 4);
+    rec.normal = vec3(0, 1, 0);
+    rec.u = rec.v = 0.25f;
+    rec.mat = 0;
+
+    solid_color tex(vec3(0.3f, 0.6f, 0.9f));
+    lambertian lam(&tex, /*owns=*/false);
+    ray scattered; vec3 atten;
+    out[0] = lam.scatter(ray(vec3(0, 5, 0), vec3(0, -1, 0), 0.0f), rec, atten, scattered, &rng) ? 1.f : 0.f;
+    out[1] = atten.x(); out[2] = atten.y(); out[3] = atten.z();
+
+    // Isotropic scatters into the unit sphere, so |dir| <= 1.
+    isotropic iso(&tex, false);
+    ray iso_scattered; vec3 iso_atten;
+    iso.scatter(ray(vec3(0, 5, 0), vec3(0, -1, 0), 0.0f), rec, iso_atten, iso_scattered, &rng);
+    out[4] = iso_scattered.direction().length() <= 1.0f ? 1.f : 0.f;
+    out[5] = (iso_scattered.origin() - rec.p).length() < 1e-5f ? 1.f : 0.f;
+}
+
+TEST(material, lambertian_attenuation_comes_from_its_texture) {
+    Scratch s(6);
+    RT_REQUIRE(s.ok());
+    k_lambertian_and_isotropic<<<1, 1>>>(s.data());
+    RT_SYNC();
+
+    RT_CHECK_NEAR(s[0], 1.0f, 0.0f);
+    RT_CHECK_VEC(s.v(1), 0.3f, 0.6f, 0.9f, kEps);
+    RT_CHECK_NEAR(s[4], 1.0f, 0.0f);
+    RT_CHECK_NEAR(s[5], 1.0f, 0.0f);
+}
+
+// =============================================================================
+// Textures
+// =============================================================================
+
+// out: [0..2]=even cell [3..5]=odd cell [6..8]=solid [9..11]=uv wrap
+//      [12]=noise in range? [13]=turb non-negative?
 __global__ void k_textures(float* out) {
     // scale 1.0 -> one cell per unit, so parity flips every integer step.
-    checker_texture chk(1.0f, new solid_color(vec3(1, 0, 0)),
-                              new solid_color(vec3(0, 0, 1)));
-    const vec3 a = chk.value(0.f, 0.f, vec3(0.5f, 0.5f, 0.5f));   // (0,0,0) -> even
-    const vec3 b = chk.value(0.f, 0.f, vec3(1.5f, 0.5f, 0.5f));   // (1,0,0) -> odd
-    out[0] = a.x(); out[1] = a.y(); out[2] = a.z();
-    out[3] = b.x(); out[4] = b.y(); out[5] = b.z();
+    solid_color a(vec3(1, 0, 0)), b(vec3(0, 0, 1));
+    checker_texture chk(1.0f, &a, &b, /*owns=*/false);
+    const vec3 e = chk.value(0.f, 0.f, vec3(0.5f, 0.5f, 0.5f));   // (0,0,0) -> even
+    const vec3 o = chk.value(0.f, 0.f, vec3(1.5f, 0.5f, 0.5f));   // (1,0,0) -> odd
+    out[0] = e.x(); out[1] = e.y(); out[2] = e.z();
+    out[3] = o.x(); out[4] = o.y(); out[5] = o.z();
 
     solid_color sc(vec3(0.1f, 0.2f, 0.3f));
     const vec3 c = sc.value(0.9f, 0.4f, vec3(100, 200, 300));     // ignores u,v,p
     out[6] = c.x(); out[7] = c.y(); out[8] = c.z();
 
     // u + 0.75 must wrap into [0,1) rather than running off the texture.
-    solid_color* probe = new solid_color(vec3(0, 0, 0));
-    uv_offset_texture off(probe, 0.75f);
-    const vec3 e = off.value(0.5f, 0.5f, vec3(0, 0, 0));
-    out[9] = e.x(); out[10] = e.y(); out[11] = e.z();
-    delete probe;
+    solid_color probe(vec3(0.5f, 0.5f, 0.5f));
+    uv_offset_texture off(&probe, 0.75f);
+    const vec3 w = off.value(0.5f, 0.5f, vec3(0, 0, 0));
+    out[9] = w.x(); out[10] = w.y(); out[11] = w.z();
+
+    // noise_texture uses the __sinf intrinsic, which is why it stays device-only.
+    noise_texture nt(4.0f);
+    bool in_range = true, non_neg = true;
+    for (int i = 0; i < 32; ++i) {
+        const vec3 p(i * 0.31f, i * -0.17f, i * 0.53f);
+        const vec3 n = nt.value(0.f, 0.f, p);
+        if (n.x() < -0.001f || n.x() > 1.001f) in_range = false;
+        if (perlin::turb(p, 5) < 0.0f) non_neg = false;
+    }
+    out[12] = in_range ? 1.f : 0.f;
+    out[13] = non_neg ? 1.f : 0.f;
 }
 
-TEST(texture, checker_parity_and_solid_color) {
-    Scratch s(12);
+TEST(texture, checker_parity_solid_and_uv_wrap) {
+    Scratch s(14);
     RT_REQUIRE(s.ok());
     k_textures<<<1, 1>>>(s.data());
     RT_SYNC();
@@ -575,52 +212,134 @@ TEST(texture, checker_parity_and_solid_color) {
     RT_CHECK_VEC(s.v(0), 1.0f, 0.0f, 0.0f, kEps);   // even -> first texture
     RT_CHECK_VEC(s.v(3), 0.0f, 0.0f, 1.0f, kEps);   // odd  -> second texture
     RT_CHECK_VEC(s.v(6), 0.1f, 0.2f, 0.3f, kEps);
-    RT_CHECK_VEC(s.v(9), 0.0f, 0.0f, 0.0f, kEps);   // wrapped lookup still valid
+    RT_CHECK_VEC(s.v(9), 0.5f, 0.5f, 0.5f, kEps);   // wrapped lookup still valid
+    RT_CHECK_NEAR(s[12], 1.0f, 0.0f);
+    RT_CHECK_NEAR(s[13], 1.0f, 0.0f);
 }
 
 // =============================================================================
-// camera
+// Material table
 // =============================================================================
+//
+// The bridge between host descriptors and device objects. If an index is
+// mishandled here every primitive in the scene gets the wrong look, so it is
+// worth checking end to end.
 
-// out: [0..2]=centre ray dir (unit)  [3..5]=origin  [6]=horiz/vert length ratio
-//      [7]=time within shutter?  [8]=lens radius
-__global__ void k_camera(float* out) {
+// out[i*3 .. i*3+2] = albedo/emission observed for material i
+__global__ void k_probe_table(material** mats, int n, float* out) {
+    if (threadIdx.x || blockIdx.x) return;
     curandState rng;
-    curand_init(11u, 0, 0, &rng);
+    curand_init(5u, 0, 0, &rng);
 
-    const vec3 lookfrom(0, 0, 5), lookat(0, 0, 0), vup(0, 1, 0);
-    camera cam(lookfrom, lookat, vup, 90.0f, 2.0f, /*aperture=*/0.0f,
-               /*focus_dist=*/5.0f, /*t0=*/0.25, /*t1=*/0.75);
+    Hit rec;
+    rec.p = vec3(0, 0, 0);
+    rec.normal = vec3(0, 1, 0);
+    rec.u = rec.v = 0.5f;
+    rec.mat = 0;
 
-    const ray r = cam.get_ray(0.5f, 0.5f, &rng);
-    const vec3 d = unit_vector(r.direction());
-    out[0] = d.x(); out[1] = d.y(); out[2] = d.z();
-    out[3] = r.origin().x(); out[4] = r.origin().y(); out[5] = r.origin().z();
-
-    // aspect = 2.0 must make the viewport exactly twice as wide as it is tall.
-    out[6] = cam.horizontal.length() / cam.vertical.length();
-    out[7] = (r.time() >= 0.25 && r.time() <= 0.75) ? 1.f : 0.f;
-    out[8] = cam.lens_radius;
+    for (int i = 0; i < n; ++i) {
+        ray scattered; vec3 atten(0, 0, 0);
+        const ray incoming(vec3(0, 1, 0), vec3(0, -1, 0), 0.0f);
+        if (mats[i]->scatter(incoming, rec, atten, scattered, &rng)) {
+            out[i * 3 + 0] = atten.x(); out[i * 3 + 1] = atten.y(); out[i * 3 + 2] = atten.z();
+        } else {
+            // Non-scattering material: report what it emits instead.
+            const vec3 e = mats[i]->emitted(rec.u, rec.v, rec.p);
+            out[i * 3 + 0] = e.x(); out[i * 3 + 1] = e.y(); out[i * 3 + 2] = e.z();
+        }
+    }
 }
 
-TEST(camera, centre_ray_points_at_the_target_and_respects_aspect) {
-    Scratch s(9);
-    RT_REQUIRE(s.ok());
-    k_camera<<<1, 1>>>(s.data());
+TEST(material_table, host_descriptors_become_the_right_device_objects) {
+    rt::MaterialLibrary lib;
+    const int lam   = lib.lambertian(vec3(0.1f, 0.2f, 0.3f));
+    const int met   = lib.metal(vec3(0.4f, 0.5f, 0.6f), 0.0f);
+    const int glass = lib.dielectric(1.5f);
+    const int light = lib.diffuse_light(vec3(7.0f, 8.0f, 9.0f));
+    const int iso   = lib.isotropic(vec3(0.7f, 0.7f, 0.7f));
+    RT_CHECK_EQ(lam, 0); RT_CHECK_EQ(met, 1); RT_CHECK_EQ(glass, 2);
+    RT_CHECK_EQ(light, 3); RT_CHECK_EQ(iso, 4);
+
+    const auto& texd = lib.textures();
+    const auto& matd = lib.materials();
+    const int n_tex = (int)texd.size(), n_mat = (int)matd.size();
+
+    rt::TexDesc* d_tex = nullptr; rt::MatDesc* d_mat = nullptr;
+    texture** tex_tab = nullptr;  material** mat_tab = nullptr;
+    RT_REQUIRE(cudaMalloc(&d_tex, n_tex * sizeof(rt::TexDesc)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&d_mat, n_mat * sizeof(rt::MatDesc)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&tex_tab, n_tex * sizeof(texture*)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&mat_tab, n_mat * sizeof(material*)) == cudaSuccess);
+    cudaMemcpy(d_tex, texd.data(), n_tex * sizeof(rt::TexDesc), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mat, matd.data(), n_mat * sizeof(rt::MatDesc), cudaMemcpyHostToDevice);
+
+    build_material_table<<<1, 1>>>(d_tex, n_tex, d_mat, n_mat, nullptr, tex_tab, mat_tab);
     RT_SYNC();
 
-    // Looking down -z from (0,0,5) at the origin.
-    RT_CHECK_VEC(s.v(0), 0.0f, 0.0f, -1.0f, 1e-4f);
-    RT_CHECK_VEC(s.v(3), 0.0f, 0.0f, 5.0f, 1e-4f);   // aperture 0 -> no lens offset
-    RT_CHECK_NEAR(s[6], 2.0f, 1e-4f);
-    RT_CHECK_NEAR(s[7], 1.0f, 0.0f);                 // shutter time in range
-    RT_CHECK_NEAR(s[8], 0.0f, 0.0f);
+    Scratch s(n_mat * 3);
+    RT_REQUIRE(s.ok());
+    k_probe_table<<<1, 1>>>(mat_tab, n_mat, s.data());
+    RT_SYNC();
+
+    RT_CHECK_VEC(s.v(lam * 3),   0.1f, 0.2f, 0.3f, kEps);
+    RT_CHECK_VEC(s.v(met * 3),   0.4f, 0.5f, 0.6f, kEps);
+    RT_CHECK_VEC(s.v(glass * 3), 1.0f, 1.0f, 1.0f, kEps);   // glass never absorbs
+    RT_CHECK_VEC(s.v(light * 3), 7.0f, 8.0f, 9.0f, kEps);   // emitted, not scattered
+    RT_CHECK_VEC(s.v(iso * 3),   0.7f, 0.7f, 0.7f, kEps);
+
+    free_material_table<<<1, 1>>>(tex_tab, n_tex, mat_tab, n_mat);
+    RT_SYNC();
+    cudaFree(mat_tab); cudaFree(tex_tab); cudaFree(d_mat); cudaFree(d_tex);
+}
+
+TEST(material_table, nested_textures_resolve_by_index) {
+    // checker(solid, solid) and uv_offset(solid) both reference children by id.
+    // The library only hands out an id after the child has one, so a single
+    // forward pass in the build kernel is enough -- this pins that invariant.
+    rt::MaterialLibrary lib;
+    const int chk = lib.lambertian(lib.checker(1.0f, vec3(1, 0, 0), vec3(0, 0, 1)));
+    const int off = lib.lambertian(lib.uv_offset(lib.solid(vec3(0.25f, 0.5f, 0.75f)), 0.5f));
+
+    const auto& texd = lib.textures();
+    const auto& matd = lib.materials();
+    for (size_t i = 0; i < texd.size(); ++i) {
+        if (texd[i].child0 >= (int)i || texd[i].child1 >= (int)i) {
+            RT_FAIL("texture " + std::to_string(i) + " references a child at or after itself");
+            return;
+        }
+    }
+
+    const int n_tex = (int)texd.size(), n_mat = (int)matd.size();
+    rt::TexDesc* d_tex = nullptr; rt::MatDesc* d_mat = nullptr;
+    texture** tex_tab = nullptr;  material** mat_tab = nullptr;
+    RT_REQUIRE(cudaMalloc(&d_tex, n_tex * sizeof(rt::TexDesc)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&d_mat, n_mat * sizeof(rt::MatDesc)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&tex_tab, n_tex * sizeof(texture*)) == cudaSuccess);
+    RT_REQUIRE(cudaMalloc(&mat_tab, n_mat * sizeof(material*)) == cudaSuccess);
+    cudaMemcpy(d_tex, texd.data(), n_tex * sizeof(rt::TexDesc), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mat, matd.data(), n_mat * sizeof(rt::MatDesc), cudaMemcpyHostToDevice);
+
+    build_material_table<<<1, 1>>>(d_tex, n_tex, d_mat, n_mat, nullptr, tex_tab, mat_tab);
+    RT_SYNC();
+
+    Scratch s(n_mat * 3);
+    RT_REQUIRE(s.ok());
+    k_probe_table<<<1, 1>>>(mat_tab, n_mat, s.data());
+    RT_SYNC();
+
+    // The probe hits p=(0,0,0), which is the even cell -> the first colour.
+    RT_CHECK_VEC(s.v(chk * 3), 1.0f, 0.0f, 0.0f, kEps);
+    RT_CHECK_VEC(s.v(off * 3), 0.25f, 0.5f, 0.75f, kEps);
+
+    free_material_table<<<1, 1>>>(tex_tab, n_tex, mat_tab, n_mat);
+    RT_SYNC();
+    cudaFree(mat_tab); cudaFree(tex_tab); cudaFree(d_mat); cudaFree(d_tex);
 }
 
 // =============================================================================
 
 int main(int argc, char** argv) {
-    std::printf("=== device tests ===\n");
+    std::printf("=== device tests (materials, textures, material table) ===\n");
 
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -632,11 +351,9 @@ int main(int argc, char** argv) {
     cudaGetDeviceProperties(&prop, 0);
     std::printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
 
-    // The BVH is still built recursively on the device, so the traversal tests
-    // need the same stack and heap headroom the real scenes ask for. Removing
-    // these two lines is one of the concrete goals of the refactor.
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64 * 1024 * 1024);
+    // Note what is *not* here any more: the old suite had to raise
+    // cudaLimitStackSize and the malloc heap before it could build a BVH on the
+    // device. Geometry no longer touches either.
 
     const int rc = rt_test::run_all(argc, argv);
     cudaDeviceReset();

@@ -81,12 +81,23 @@ else()
   target_compile_options(test_math PRIVATE -Wall -Wextra)
 endif()
 
+# Geometry, BVH and scene construction are now POD + free functions, so they
+# test on the host too. This target needs no GPU.
+add_executable(test_geometry tests/test_geometry.cpp)
+target_compile_features(test_geometry PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(test_geometry PRIVATE /W4 /wd4996)
+else()
+  target_compile_options(test_geometry PRIVATE -Wall -Wextra)
+endif()
+
 add_executable(test_device tests/test_device.cu)
 target_link_libraries(test_device PRIVATE rt_flags)
 set_property(TARGET test_device PROPERTY CUDA_RUNTIME_LIBRARY Hybrid)
 
-add_test(NAME math   COMMAND test_math)
-add_test(NAME device COMMAND test_device)
+add_test(NAME math     COMMAND test_math)
+add_test(NAME geometry COMMAND test_geometry)
+add_test(NAME device   COMMAND test_device)
 
 # test_device returns 77 when no GPU is present, so CTest reports "skipped"
 # rather than a hard failure on a CI box without a device.
@@ -105,4 +116,4 @@ else()
   message(STATUS "Python3 not found; skipping the golden-image test.")
 endif()
 
-set_tests_properties(math device PROPERTIES LABELS unit)
+set_tests_properties(math geometry device PROPERTIES LABELS unit)

@@ -185,7 +185,9 @@ See [tests/README.md](tests/README.md) and [bench/README.md](bench/README.md).
 - **Bounded depth instead of recursion**: the book’s recursive `color()` is turned into a loop (default max depth = 50) to avoid device stack overflows.
 - **Per-pixel RNG**: Each thread has a `curandState`. We copy the state to a local variable, sample multiple times, then write it back.
 - **Unified memory for the framebuffer** (`cudaMallocManaged`) to simplify host readout (`stdout` → PPM).
-- **Device-side scene build**: A small kernel constructs the world and camera once, then the main render kernel traces rays. This is forced by the design rather than chosen: a vtable pointer is a device address, so a polymorphic object cannot be built on the host and copied over.
+- **Host-side scene build**: geometry is POD in flat arrays, so the scene and its BVH are built on the CPU and memcpy'd over. This is only possible because the primitives are not polymorphic -- a vtable pointer is a device address, so an object with virtual functions cannot be built on the host and copied to the device. That single constraint is what forced the original design to build everything in a `<<<1,1>>>` kernel.
+- **Tagged dispatch**: `hit_prim` switches on a small enum instead of making an indirect call, so intersection inlines and a warp straddling two primitive types costs a predicated branch rather than two serialised call targets.
+- **The camera is passed by value**, not through a `camera**`. It has no virtual functions, so there was never a reason to allocate it on the device.
 - **Iterative BVH traversal**: an explicit stack rather than recursion. Recursing cost two `hit_record`s per level in *local* memory (which is global memory with a per-thread address), and could not use a hit in the near child to prune the far one until after the far one had been traversed. Worth 7-13x on scenes with real geometry.
 - **Batched sample accumulation**: `render_accumulate` adds samples into a buffer; `resolve` normalises and gamma-encodes once at the end. Identical math to one long launch, but each launch stays under the Windows display watchdog.
 - **Thin-lens DOF**: `random_in_unit_disk` samples the aperture; `lower_left_corner`, `horizontal`, and `vertical` are scaled by the **focus distance**; `lens_radius = aperture/2`.
@@ -206,32 +208,22 @@ See [tests/README.md](tests/README.md) and [bench/README.md](bench/README.md).
 
 ## Known limitations
 
-Honest list of what the current implementation still does badly, in rough order
-of cost. (Traversal was the big one and is fixed -- see the layout note below.)
-
-- **Scene construction runs on one CUDA thread.** `create_world_*` launches as
-  `<<<1,1>>>`, and the BVH *build* still uses an O(n^2) selection sort inside a
-  recursive constructor. Measured: 10 objects -> 21 ms, 488 -> 163 ms,
-  1409 -> **1590 ms**. For the `final` scene the build is now a larger share of
-  total time than it was, because the render got 12x faster and the build did
-  not move at all.
-- **Everything is a `__device__` virtual allocated with device `new`.** Objects
-  land scattered across the device malloc heap, so traversal is a pointer chase
-  through uncoalesced global memory, and every `hit()` is an indirect call that
-  cannot inline and serialises when lanes in a warp hit different types.
-- **The recursive BVH build still forces a deep stack reservation**
-  (`cudaLimitStackSize`, 16-64 KB per thread). Traversal no longer needs it --
-  `--render-stack` can shrink it before the render kernel -- but on an RTX 5070
-  that measured inside the noise, and going below ~2 KB faults.
-- **Instancing wrappers leak.** `translate` and `rotate_y` do not delete the
-  object they wrap, and materials shared between primitives are marked
-  non-owning to avoid a double free, so neither is ever freed.
-  `compute-sanitizer --leak-check full` reports ~19 leaked allocations for the
-  Cornell scene, and **0 invalid accesses**.
-- **The instancing wrappers drop the RNG.** `translate`/`rotate_y`/`with_material`
-  forward their 5-argument `hit` to the 4-argument one. No current scene nests a
-  `constant_medium` under an instance wrapper, so this is latent rather than
-  live, but it would silently degrade a volume that was.
+- **Materials and textures are still a device-only virtual hierarchy.** They are
+  built by a small kernel from host descriptors and referenced by index, so they
+  no longer block host-side scene construction, but shading still pays an
+  indirect call. There are tens of them per scene rather than thousands of
+  primitives, so this is not where the time goes.
+- **The BVH uses a median split, not a surface-area heuristic.** That is what the
+  book does. SAH would give better traversal on the box-heavy scenes; it would
+  also stop the tree matching the book's.
+- **One primitive per leaf.** Small leaves mean more nodes and more box tests.
+  Packing 2-4 primitives per leaf is usually a win and is easy from here.
+- **Instancing is baked, not shared.** A rotated box becomes six transformed
+  quads, so N copies of a mesh cost N copies of the geometry. Fine at this scale
+  (the largest scene is 3409 primitives); it would not be for a real asset.
+- **`bouncing` uses a host xorshift** rather than cuRAND for scene layout, so its
+  sphere placement differs from the pre-refactor version. The scene is now
+  reproducible from `--seed` without a GPU, which it was not before.
 
 ---
 
@@ -239,16 +231,33 @@ of cost. (Traversal was the big one and is fixed -- see the layout note below.)
 
 ```
 src/
-  core/     pure math. Dual-compiled: nvcc for the renderer, and a plain host
-            C++ compiler for tests/test_math.cpp. No cuRAND state, no device
-            allocation, no virtuals. cuda_compat.hpp defines the annotations
-            away for host builds, so this boundary is enforced by the build
-            rather than by convention.
-  scene/    the device-only object model: hittables, materials, textures,
-            camera, BVH. Virtual dispatch and device `new` live here. nvcc only.
-  io/       host-side image loading and asset path resolution.
-  main.cu   kernels, scene table, CLI, render driver.
+  core/     Pure math and POD, dual-compiled. vec3/ray/aabb, primitives and
+            their intersection routines, the flattened BVH and its traversal,
+            the camera, Perlin noise. Compiled by nvcc for the renderer and by
+            a plain host compiler for the tests -- cuda_compat.hpp defines the
+            __host__/__device__ annotations away when nvcc is not driving the
+            build, so the boundary is enforced by the build rather than by
+            convention.
+  host/     Scene authoring. Book-style C++ that emits flat arrays: the scene
+            descriptions, the BVH builder, and the material/texture descriptor
+            records.
+  scene/    What genuinely has to live on the device: the material and texture
+            class hierarchy, the kernel that instantiates it from descriptors,
+            and the scene upload.
+  io/       Image loading and asset path resolution.
+  main.cu   Kernels, CLI, render driver.
 ```
+
+### How a scene becomes pixels
+
+1. `host/scenes.hpp` builds `std::vector<Sphere|Quad|Medium>` plus a material
+   descriptor list, on the CPU. Instancing transforms are applied to the
+   geometry here, once, instead of to every ray at trace time.
+2. `SceneBuilder::build_bvh()` builds a flattened BVH with `std::nth_element`.
+3. `upload_scene()` memcpys the arrays over -- possible only because they are
+   POD -- and runs one small kernel to instantiate the materials.
+4. `render_accumulate` traverses with an explicit stack and dispatches on a
+   primitive tag.
 
 ---
 
