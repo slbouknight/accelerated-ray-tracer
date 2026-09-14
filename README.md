@@ -146,6 +146,7 @@ build\bin\Release\rayTracer.exe --scene original --width 400 --height 400 --spp 
 | `--out FILE` | write here instead of stdout |
 | `--stats FILE` | write timing JSON (`build_ms`, `render_ms`, …) |
 | `--ascii` | emit P3 text PPM instead of P6 binary |
+| `--render-stack N` | shrink the per-thread stack before rendering (default `0` = off) |
 | `--quiet` | suppress the progress line |
 
 The renderer writes **binary PPM (P6)** by default; `--ascii` gives the P3 text
@@ -184,7 +185,9 @@ See [tests/README.md](tests/README.md) and [bench/README.md](bench/README.md).
 - **Bounded depth instead of recursion**: the book’s recursive `color()` is turned into a loop (default max depth = 50) to avoid device stack overflows.
 - **Per-pixel RNG**: Each thread has a `curandState`. We copy the state to a local variable, sample multiple times, then write it back.
 - **Unified memory for the framebuffer** (`cudaMallocManaged`) to simplify host readout (`stdout` → PPM).
-- **Device-side scene build**: A small kernel constructs the world and camera once, then the main render kernel traces rays.
+- **Device-side scene build**: A small kernel constructs the world and camera once, then the main render kernel traces rays. This is forced by the design rather than chosen: a vtable pointer is a device address, so a polymorphic object cannot be built on the host and copied over.
+- **Iterative BVH traversal**: an explicit stack rather than recursion. Recursing cost two `hit_record`s per level in *local* memory (which is global memory with a per-thread address), and could not use a hit in the near child to prune the far one until after the far one had been traversed. Worth 7-13x on scenes with real geometry.
+- **Batched sample accumulation**: `render_accumulate` adds samples into a buffer; `resolve` normalises and gamma-encodes once at the end. Identical math to one long launch, but each launch stays under the Windows display watchdog.
 - **Thin-lens DOF**: `random_in_unit_disk` samples the aperture; `lower_left_corner`, `horizontal`, and `vertical` are scaled by the **focus distance**; `lens_radius = aperture/2`.
 
 ---
@@ -196,34 +199,56 @@ See [tests/README.md](tests/README.md) and [bench/README.md](bench/README.md).
 - **Max depth** (`--max-depth`): 50 is a good default; raising it gives diminishing returns.
 - **Aperture**: small (`0.1`) = subtle blur; large (`2.0`) = strong DOF (needs more spp). Per-scene, in `src/main.cu`.
 - **Build config**: **Release**, always, for anything you intend to time.
-- **Block size** (`--block`): `8 8` (64 threads) gives good 2D ray coherence but modest occupancy. Sweep it — `16 8` and `8 4` are both worth measuring on your GPU.
+- **Block size** (`--block`): `8 8` (64 threads) measured fastest on an RTX 5070; `16 8` and `8 4` were within 1%, `16 16` was 9% slower. Worth re-sweeping on a different GPU, but the default is already a good one.
+- **Batch size** (`--batch`): only affects watchdog headroom and progress granularity, not the result. Lower it if a single launch still trips TDR.
 
 ---
 
 ## Known limitations
 
-Honest list of what the current implementation does badly, in rough order of
-how much it costs:
+Honest list of what the current implementation still does badly, in rough order
+of cost. (Traversal was the big one and is fixed -- see the layout note below.)
 
 - **Scene construction runs on one CUDA thread.** `create_world_*` launches as
-  `<<<1,1>>>`, and the BVH build inside it uses an O(n²) selection sort. Measured
-  build times: 10 objects → 21 ms, 488 → 164 ms, 1409 → **1603 ms**. For the
-  `final` scene the BVH build takes longer than a 200×200×8spp render.
+  `<<<1,1>>>`, and the BVH *build* still uses an O(n^2) selection sort inside a
+  recursive constructor. Measured: 10 objects -> 21 ms, 488 -> 163 ms,
+  1409 -> **1590 ms**. For the `final` scene the build is now a larger share of
+  total time than it was, because the render got 12x faster and the build did
+  not move at all.
 - **Everything is a `__device__` virtual allocated with device `new`.** Objects
   land scattered across the device malloc heap, so traversal is a pointer chase
   through uncoalesced global memory, and every `hit()` is an indirect call that
-  cannot inline and serialises when threads in a warp hit different types.
-- **The BVH is built recursively on the device**, which is why every scene has
-  to raise `cudaLimitStackSize` to 16–64 KB. That reservation is per-thread and
-  scales with resident threads, costing both VRAM and occupancy.
-- **`double` on the hot path.** `ray::tm`, `hit_record::u/v` and
-  `camera::time0/time1` are `double`, so `point_at_parameter` promotes to FP64 —
-  which runs at 1/64 rate on a GeForce card.
+  cannot inline and serialises when lanes in a warp hit different types.
+- **The recursive BVH build still forces a deep stack reservation**
+  (`cudaLimitStackSize`, 16-64 KB per thread). Traversal no longer needs it --
+  `--render-stack` can shrink it before the render kernel -- but on an RTX 5070
+  that measured inside the noise, and going below ~2 KB faults.
 - **Instancing wrappers leak.** `translate` and `rotate_y` do not delete the
   object they wrap, and materials shared between primitives are marked
-  non-owning to avoid a double free, so they are never freed.
+  non-owning to avoid a double free, so neither is ever freed.
   `compute-sanitizer --leak-check full` reports ~19 leaked allocations for the
   Cornell scene, and **0 invalid accesses**.
+- **The instancing wrappers drop the RNG.** `translate`/`rotate_y`/`with_material`
+  forward their 5-argument `hit` to the 4-argument one. No current scene nests a
+  `constant_medium` under an instance wrapper, so this is latent rather than
+  live, but it would silently degrade a volume that was.
+
+---
+
+## Source layout
+
+```
+src/
+  core/     pure math. Dual-compiled: nvcc for the renderer, and a plain host
+            C++ compiler for tests/test_math.cpp. No cuRAND state, no device
+            allocation, no virtuals. cuda_compat.hpp defines the annotations
+            away for host builds, so this boundary is enforced by the build
+            rather than by convention.
+  scene/    the device-only object model: hittables, materials, textures,
+            camera, BVH. Virtual dispatch and device `new` live here. nvcc only.
+  io/       host-side image loading and asset path resolution.
+  main.cu   kernels, scene table, CLI, render driver.
+```
 
 ---
 

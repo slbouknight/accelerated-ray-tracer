@@ -3,6 +3,7 @@
 
 #include <math_constants.h>
 
+#include "../core/shading_math.hpp"   // get_sphere_uv
 #include "hittable.cuh"
 #include "material.cuh"
 #include <math.h>
@@ -19,7 +20,7 @@ class sphere : public hittable
 
         // Static sphere -> zero velocity
         __device__ sphere(vec3 cen, float r, material* m, bool owns=true)
-            : center(ray(cen, vec3(0,0,0), 0.0)), radius(r), mat_ptr(m), owns_mat(owns)
+            : center(ray(cen, vec3(0,0,0), 0.0f)), radius(r), mat_ptr(m), owns_mat(owns)
         {
             vec3 rvec(radius, radius, radius);
             bbox = aabb(cen - rvec, cen + rvec);
@@ -30,28 +31,17 @@ class sphere : public hittable
         // was on the device heap, so ~sphere would delete the material or not
         // at random -- a double free on some runs and a leak on others.
         __device__ sphere(vec3 cen1, vec3 cen2, float r, material* m, bool owns=true)
-            : center(ray(cen1, cen2 - cen1, 0.0)), radius(r), mat_ptr(m), owns_mat(owns)
+            : center(ray(cen1, cen2 - cen1, 0.0f)), radius(r), mat_ptr(m), owns_mat(owns)
         {
             vec3 rvec(radius, radius, radius);
-            vec3 c0 = center.point_at_parameter(0.0);
-            vec3 c1 = center.point_at_parameter(1.0);
+            vec3 c0 = center.point_at_parameter(0.0f);
+            vec3 c1 = center.point_at_parameter(1.0f);
             aabb box0(c0 - rvec, c0 + rvec);
             aabb box1(c1 - rvec, c1 + rvec);
             bbox = aabb::surrounding_box(box0, box1);
         }
 
         __device__ aabb bounding_box() const override { return bbox; }
-
-        // Static + dual-compiled: callable from host tests without needing to
-        // instantiate the (device-only, polymorphic) sphere itself.
-        __host__ __device__ static void get_sphere_uv(const vec3& p, double& u, double& v)
-        {
-            auto theta = std::acos(-p.y());
-            auto phi = std::atan2(-p.z(), p.x()) + CUDART_PI_F;
-
-            u = phi / (2 * CUDART_PI_F);
-            v = theta / CUDART_PI_F;
-        }
 
         __device__ bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const override 
         {

@@ -1,9 +1,10 @@
-#ifndef AABB_CUH
-#define AABB_CUH
+#pragma once
+
+#include "cuda_compat.hpp"
 
 #include <float.h>
-#include "vec3.cuh"
-#include "ray.cuh"
+#include "vec3.hpp"
+#include "ray.hpp"
 
 class aabb
 {
@@ -11,27 +12,27 @@ class aabb
         vec3 minimum;
         vec3 maximum;
 
-        __host__ __device__ aabb() : minimum(vec3( FLT_MAX,  FLT_MAX,  FLT_MAX)),
+        RT_HD aabb() : minimum(vec3( FLT_MAX,  FLT_MAX,  FLT_MAX)),
             maximum(vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX)) {}
 
-        __host__ __device__ aabb(const vec3& a, const vec3& b) 
+        RT_HD aabb(const vec3& a, const vec3& b) 
         {
             minimum = vec3(fminf(a.x(), b.x()), fminf(a.y(), b.y()), fminf(a.z(), b.z()));
             maximum = vec3(fmaxf(a.x(), b.x()), fmaxf(a.y(), b.y()), fmaxf(a.z(), b.z()));
         }
 
-        __host__ __device__ const vec3& min() const { return minimum; }
-        __host__ __device__ const vec3& max() const { return maximum; }
+        RT_HD const vec3& min() const { return minimum; }
+        RT_HD const vec3& max() const { return maximum; }
 
         // Pad box to avoid zero-width slabs
-        __host__ __device__ aabb pad(float delta) const 
+        RT_HD aabb pad(float delta) const 
         {
             vec3 d(delta, delta, delta);
             return aabb(minimum - d, maximum + d);
         }
 
         // Surrounding box helper
-        __host__ __device__ static aabb surrounding_box(const aabb& box0, const aabb& box1) 
+        RT_HD static aabb surrounding_box(const aabb& box0, const aabb& box1) 
         {
             vec3 small(fminf(box0.minimum.x(), box1.minimum.x()),
                     fminf(box0.minimum.y(), box1.minimum.y()),
@@ -44,7 +45,7 @@ class aabb
 
         // Pure float math, no curand / no device heap -> dual-compiled so the
         // slab test can be unit-tested on the host without a GPU.
-        __host__ __device__ bool hit(const ray& r, float tmin, float tmax) const
+        RT_HD bool hit(const ray& r, float tmin, float tmax) const
         {
         for (int a = 0; a < 3; a++) {
             float invD = 1.0f / r.direction()[a];
@@ -63,22 +64,10 @@ class aabb
     }
 };
 
-__host__ __device__ static aabb empty() 
-{
-    return aabb(vec3( FLT_MAX,  FLT_MAX,  FLT_MAX),
-                vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX));
-}
-__host__ __device__ static aabb universe() 
-{
-    return aabb(vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX),
-                vec3( FLT_MAX,  FLT_MAX,  FLT_MAX));
-}
-
 // Shift an AABB by an offset (component-wise).
-__host__ __device__ inline aabb operator+(const aabb& box, const vec3& offset) 
+RT_HD inline aabb operator+(const aabb& box, const vec3& offset) 
 {
     return aabb(box.minimum + offset, box.maximum + offset);
 }
 
 
-#endif

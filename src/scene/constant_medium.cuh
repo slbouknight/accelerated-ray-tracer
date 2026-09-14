@@ -4,7 +4,7 @@
 #include "hittable.cuh"
 #include "material.cuh"
 #include "texture.cuh"
-#include "aabb.cuh"
+#include "../core/aabb.hpp"
 
 // tiny xorshift RNG to avoid needing curand in the object itself
 __device__ inline float rng01_from_seed(unsigned int seed) {
@@ -32,9 +32,25 @@ public:
         delete phase_function;
     }
 
-    // Preferred path: uses the caller’s RNG
+    // Preferred path: uses the caller's per-pixel RNG.
+    //
+    // A null rng means we were reached through a path that has none. Seeding a
+    // fresh curandState here is expensive -- XORWOW init is thousands of cycles,
+    // paid on every intersection test against the volume -- so it is strictly a
+    // fallback. Before BVH traversal threaded the RNG through, this was the
+    // *only* path volumes ever took.
     __device__ bool hit(const ray& r, float tmin, float tmax,
                         hit_record& rec, curandState* rng) const override {
+        curandState fallback;
+        if (!rng) {
+            const unsigned int seed = 1337u
+                ^ __float_as_uint(r.origin().x())
+                ^ __float_as_uint(r.origin().y() * 3.1f)
+                ^ __float_as_uint(r.direction().z() * 5.7f);
+            curand_init(seed, 0, 0, &fallback);
+            rng = &fallback;
+        }
+
         hit_record rec1, rec2;
         if (!boundary->hit(r, -FLT_MAX,  FLT_MAX, rec1, rng)) return false;
         if (!boundary->hit(r, rec1.t + 1e-4f, FLT_MAX, rec2, rng)) return false;
@@ -63,16 +79,9 @@ public:
         return true;
     }
 
-    // Fallback: keep a deterministic path if no RNG was provided
     __device__ bool hit(const ray& r, float tmin, float tmax,
                         hit_record& rec) const override {
-        curandState fake;
-        unsigned int seed = 1337u
-            ^ __float_as_uint(r.origin().x())
-            ^ __float_as_uint(r.origin().y()*3.1f)
-            ^ __float_as_uint(r.direction().z()*5.7f);
-        curand_init(seed, 0, 0, &fake);
-        return hit(r, tmin, tmax, rec, &fake);
+        return hit(r, tmin, tmax, rec, nullptr);
     }
 
 

@@ -68,9 +68,18 @@ add_custom_command(TARGET rayTracer POST_BUILD
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-add_executable(test_math tests/test_math.cu)
-target_link_libraries(test_math PRIVATE rt_flags)
-set_property(TARGET test_math PROPERTY CUDA_RUNTIME_LIBRARY Hybrid)
+# test_math is a plain C++ target -- no CUDA language, no cudart, not compiled
+# by nvcc. src/core/cuda_compat.hpp defines the annotations away for host
+# builds, so this compiling at all is the proof that src/core really is free of
+# device-only constructs. If someone drops a __sinf or a curandState into a core
+# header, this target breaks immediately and names the file.
+add_executable(test_math tests/test_math.cpp)
+target_compile_features(test_math PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(test_math PRIVATE /W4 /wd4996)
+else()
+  target_compile_options(test_math PRIVATE -Wall -Wextra)
+endif()
 
 add_executable(test_device tests/test_device.cu)
 target_link_libraries(test_device PRIVATE rt_flags)

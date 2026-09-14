@@ -3,7 +3,7 @@
 
 #include <math_constants.h>
 #include <curand_kernel.h>
-#include "ray.cuh"
+#include "../core/ray.hpp"
 
 __device__ inline vec3 random_in_unit_disk(curandState *local_rand_state) {
     vec3 p;
@@ -20,14 +20,14 @@ public:
     // Original constructor preserved: no motion blur (time0 = time1 = 0)
     __device__ camera(vec3 lookfrom, vec3 lookat, vec3 vup,
                       float vfov, float aspect, float aperture, float focus_dist)
-        : time0(0.0), time1(0.0) {
+        : time0(0.0f), time1(0.0f) {
         init(lookfrom, lookat, vup, vfov, aspect, aperture, focus_dist);
     }
 
     // Motion‑blur constructor: supply shutter open/close times
     __device__ camera(vec3 lookfrom, vec3 lookat, vec3 vup,
                       float vfov, float aspect, float aperture, float focus_dist,
-                      double t0, double t1)
+                      float t0, float t1)
         : time0(t0), time1(t1) {
         init(lookfrom, lookat, vup, vfov, aspect, aperture, focus_dist);
     }
@@ -37,7 +37,7 @@ public:
         vec3 offset = u * rd.x() + v * rd.y();
 
         // Uniformly sample a shutter time in [time0, time1]
-        double tm = time0 + (double)curand_uniform(local_rand_state) * (time1 - time0);
+        float tm = time0 + curand_uniform(local_rand_state) * (time1 - time0);
 
         return ray(
             origin + offset,
@@ -53,7 +53,7 @@ public:
     vec3 vertical;
     vec3 u, v, w;
     float lens_radius;
-    double time0, time1; // shutter open/close
+    float time0, time1; // shutter open/close
 
 private:
     __device__ void init(vec3 lookfrom, vec3 lookat, vec3 vup,

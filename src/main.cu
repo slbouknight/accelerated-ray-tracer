@@ -10,19 +10,22 @@
 #include <string>
 #include <vector>
 
-#include "bvh.cuh"
-#include "camera.cuh"
-#include "constant_medium.cuh"
-#include "hittable_list.cuh"
-#include "image_io.h"
-#include "material.cuh"
-#include "perlin.cuh"
-#include "ray.cuh"
-#include "quad.cuh"
-#include "sphere.cuh"
-#include "texture.cuh"
-#include "util.cuh"
-#include "vec3.cuh"
+// core/ is dual-compiled pure math; scene/ is the device-only object model;
+// io/ is host-side file handling. See core/cuda_compat.hpp for the rationale.
+#include "core/hash_rng.hpp"
+#include "core/perlin.hpp"
+#include "core/ray.hpp"
+#include "core/vec3.hpp"
+
+#include "io/image_io.hpp"
+
+#include "scene/bvh.cuh"
+#include "scene/camera.cuh"
+#include "scene/constant_medium.cuh"
+#include "scene/material.cuh"
+#include "scene/quad.cuh"
+#include "scene/sphere.cuh"
+#include "scene/texture.cuh"
 
 #define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line)
@@ -275,7 +278,7 @@ __global__ void create_world_bouncing(hittable **d_list, hittable **d_world, cam
         *d_camera = new camera(lookfrom, lookat, vup,
                                30.0f, float(nx)/float(ny),
                                aperture, dist_to_focus,
-                               /*time0=*/0.0, /*time1=*/1.0);
+                               /*time0=*/0.0f, /*time1=*/1.0f);
     }
 }
 
@@ -318,7 +321,7 @@ __global__ void create_world_checker(hittable **d_list, hittable **d_world, came
         *d_camera = new camera(lookfrom, lookat, vup,
                                20.0f, float(nx)/float(ny),
                                aperture, dist_to_focus,
-                               0.0, 1.0);
+                               0.0f, 1.0f);
 
         *rand_state = local_rand_state;
     }
@@ -352,7 +355,7 @@ __global__ void create_world_earth(hittable **d_list, hittable **d_world, camera
         *d_camera = new camera(lookfrom, lookat, vup,
                                20.0f, float(nx)/float(ny),
                                aperture, dist_to_focus,
-                               0.0, 1.0);
+                               0.0f, 1.0f);
     }
 }
 
@@ -382,7 +385,7 @@ __global__ void create_world_perlin(hittable **d_list, hittable **d_world, camer
         vec3 lookfrom(13,2,3), lookat(0,0,0), vup(0,1,0);
         *d_camera = new camera(lookfrom, lookat, vup,
                                20.0f, float(nx)/float(ny),
-                               0.0f, 10.0f, 0.0, 1.0);
+                               0.0f, 10.0f, 0.0f, 1.0f);
     }
 }
 
@@ -415,7 +418,7 @@ __global__ void create_world_quads(hittable **d_list, hittable **d_world, camera
         vec3 lookfrom(0,0,9), lookat(0,0,0), vup(0,1,0);
         *d_camera = new camera(lookfrom, lookat, vup,
                                80.0f, float(nx)/float(ny),
-                               0.0f, 10.0f, 0.0, 1.0);
+                               0.0f, 10.0f, 0.0f, 1.0f);
     }
 }
 
@@ -462,7 +465,7 @@ __global__ void create_world_simple_light(hittable **d_list, hittable **d_world,
     *d_camera = new camera(lookfrom, lookat, vup,
                            20.0f, float(nx)/float(ny),
                            0.0f, dist_to_focus,
-                           0.0, 1.0);
+                           0.0f, 1.0f);
 }
 
 __global__ void create_world_cornell(hittable **d_list, hittable **d_world, camera **d_camera,
@@ -521,7 +524,7 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
     *d_camera = new camera(lookfrom, lookat, vup,
                            40.0f, float(nx)/float(ny),
                            0.0f, dist_to_focus,
-                           0.0, 1.0);
+                           0.0f, 1.0f);
 }
 
 __global__ void create_world_cornell_smoke(hittable **d_list, hittable **d_world, camera **d_camera,
@@ -647,7 +650,7 @@ __global__ void create_world_final(hittable **d_list, hittable **d_world, camera
     *d_camera = new camera(lookfrom, lookat, vup,
                            40.0f, float(nx)/float(ny),
                            0.0f, (lookfrom-lookat).length(),
-                           0.0, 1.0);
+                           0.0f, 1.0f);
 }
 
 __global__ void create_world_original(hittable **d_list, hittable **d_world, camera **d_camera,
@@ -725,7 +728,7 @@ __global__ void create_world_original(hittable **d_list, hittable **d_world, cam
     *d_camera = new camera(lookfrom, lookat, vup,
                            40.0f, float(nx)/float(ny),
                            0.0f, (lookfrom-lookat).length(),
-                           0.0, 1.0);
+                           0.0f, 1.0f);
 }
 __global__ void free_world(hittable **d_list, int count,
                            hittable **d_world,
@@ -849,6 +852,13 @@ struct Options {
     int          tx          = 8;
     int          ty          = 8;
     int          batch       = 64;      // samples per kernel launch; see below
+    // Shrink the per-thread stack before the render kernel. Off by default:
+    // iterative traversal made this *possible*, but measured gain on an
+    // RTX 5070 is inside the noise (occupancy here is register-bound, not
+    // local-memory-bound), and setting it too low is a cliff -- 1024 bytes
+    // faults with cudaErrorIllegalAddress. Kept as a knob for GPUs where the
+    // tradeoff differs. 0 = leave the build-time limit in place.
+    int          render_stack = 0;
     std::string  out;                   // empty -> stdout
     std::string  stats;                 // empty -> no machine-readable stats
     bool         binary     = true;     // P6 by default; --ascii for P3
@@ -901,6 +911,7 @@ static bool parse_args(int argc, char** argv, Options* o) {
         else if (a == "--gamma")     { if (!need(++i, "--gamma")) return false;     o->gamma = (float)std::atof(argv[i]); }
         else if (a == "--seed")      { if (!need(++i, "--seed")) return false;      o->seed = std::strtoull(argv[i], nullptr, 10); }
         else if (a == "--batch")     { if (!need(++i, "--batch")) return false;     o->batch = std::atoi(argv[i]); }
+        else if (a == "--render-stack") { if (!need(++i, "--render-stack")) return false; o->render_stack = std::atoi(argv[i]); }
         else if (a == "--out")       { if (!need(++i, "--out")) return false;       o->out = argv[i]; }
         else if (a == "--stats")     { if (!need(++i, "--stats")) return false;     o->stats = argv[i]; }
         else if (a == "--block") {
@@ -1043,6 +1054,16 @@ static int run_scene(const SceneSpec& spec, const Options& opt)
                      spec.name, built, nx, ny, ns, opt.max_depth);
 
     // --- render -------------------------------------------------------------
+    // The deep stack above is only needed by the *build* kernel, whose BVH
+    // constructor still recurses. Traversal is iterative now, so the render
+    // kernel needs barely any stack -- and cudaLimitStackSize is a per-thread
+    // reservation in local memory, so shrinking it before the render frees
+    // memory and can improve occupancy. The limit is device-wide, not
+    // per-kernel, so it has to be lowered between launches.
+    if (opt.render_stack > 0) {
+        checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, (size_t)opt.render_stack));
+    }
+
     checkCudaErrors(cudaEventRecord(ev_render0));
     clear_buffer<<<(num_pixels + 255) / 256, 256>>>(accum, num_pixels);
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state, opt.seed);
@@ -1103,12 +1124,13 @@ static int run_scene(const SceneSpec& spec, const Options& opt)
                 "  \"objects\": %d,\n"
                 "  \"block\": [%d, %d],\n"
                 "  \"batch\": %d,\n"
+                "  \"render_stack\": %d,\n"
                 "  \"build_ms\": %.4f,\n"
                 "  \"render_ms\": %.4f,\n"
                 "  \"primary_rays\": %lld\n"
                 "}\n",
                 prop.name, spec.name, nx, ny, ns, opt.max_depth, opt.seed, built,
-                opt.tx, opt.ty, batch, build_ms, render_ms,
+                opt.tx, opt.ty, batch, opt.render_stack, build_ms, render_ms,
                 (long long)num_pixels * ns);
             std::fclose(sf);
         } else {
@@ -1142,6 +1164,10 @@ static int run_scene(const SceneSpec& spec, const Options& opt)
 
 int main(int argc, char** argv)
 {
+    // Lets scenes find textures/ whether the binary is launched from the
+    // build root, from bin/Release, or from a script somewhere else.
+    set_asset_search_root(argc > 0 ? argv[0] : nullptr);
+
     Options opt;
     if (!parse_args(argc, argv, &opt)) return 1;
 

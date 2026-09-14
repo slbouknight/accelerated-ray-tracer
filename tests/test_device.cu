@@ -17,15 +17,15 @@
 #include <curand_kernel.h>
 #include <cfloat>
 
-#include "../src/bvh.cuh"
-#include "../src/camera.cuh"
-#include "../src/hittable.cuh"
-#include "../src/material.cuh"
-#include "../src/quad.cuh"
-#include "../src/sphere.cuh"
-#include "../src/texture.cuh"
-#include "../src/util.cuh"
-#include "../src/vec3.cuh"
+#include "../src/scene/bvh.cuh"
+#include "../src/scene/camera.cuh"
+#include "../src/scene/hittable.cuh"
+#include "../src/scene/material.cuh"
+#include "../src/scene/quad.cuh"
+#include "../src/scene/sphere.cuh"
+#include "../src/scene/texture.cuh"
+#include "../src/core/hash_rng.hpp"
+#include "../src/core/vec3.hpp"
 
 namespace {
 

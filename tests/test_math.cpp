@@ -1,22 +1,24 @@
-// Host-side unit tests for the dual-compiled (__host__ __device__) math layer.
+// Host-side unit tests for src/core -- the dual-compiled math layer.
 //
-// Nothing in this file touches the GPU: it runs on a machine with no CUDA
-// device present. That is the point -- every routine covered here is pure
-// float math with no cuRAND state, no device heap allocation and no virtual
-// dispatch, which is exactly the set of code that *should* be dual-compiled.
+// This is a .cpp, compiled by the *host* compiler with no CUDA involvement at
+// all. src/core/cuda_compat.hpp defines __host__/__device__ away when nvcc is
+// not driving the build, so every header included here has to be genuinely
+// free of device-only constructs: no cuRAND state, no device `new`, no
+// __sinf-style intrinsics, no virtual dispatch. If one leaks in, this target
+// stops compiling -- which is the point. The boundary is enforced by the
+// build rather than by a comment.
 //
-// The inverse is also informative: the small size of this file relative to
-// test_device.cu is a direct measure of how much of the renderer is currently
-// locked behind device-only polymorphism.
+// The inverse is also informative: the size of this file relative to
+// test_device.cu measures how much of the renderer is still locked behind
+// device-only polymorphism.
 
 #include "test_harness.h"
 
-#include "../src/aabb.cuh"
-#include "../src/material.cuh"
-#include "../src/perlin.cuh"
-#include "../src/ray.cuh"
-#include "../src/sphere.cuh"
-#include "../src/vec3.cuh"
+#include "../src/core/aabb.hpp"
+#include "../src/core/shading_math.hpp"
+#include "../src/core/perlin.hpp"
+#include "../src/core/ray.hpp"
+#include "../src/core/vec3.hpp"
 
 namespace {
 constexpr float kEps = 1e-5f;
@@ -268,22 +270,22 @@ TEST(material_math, schlick_endpoints_and_monotonicity) {
 // =============================================================================
 
 TEST(sphere_uv, known_points_on_the_unit_sphere) {
-    double u = 0.0, v = 0.0;
+    float u = 0.0f, v = 0.0f;
 
     // -Z faces the default camera. phi = atan2(1,0)+pi = 3pi/2 -> u = 0.75
-    sphere::get_sphere_uv(vec3(0, 0, -1), u, v);
+    get_sphere_uv(vec3(0, 0, -1), u, v);
     RT_CHECK_NEAR(u, 0.75, 1e-5);
     RT_CHECK_NEAR(v, 0.50, 1e-5);
 
     // +X: phi = atan2(0,1)+pi = pi -> u = 0.5
-    sphere::get_sphere_uv(vec3(1, 0, 0), u, v);
+    get_sphere_uv(vec3(1, 0, 0), u, v);
     RT_CHECK_NEAR(u, 0.50, 1e-5);
     RT_CHECK_NEAR(v, 0.50, 1e-5);
 
     // Poles: v runs 0 at -Y to 1 at +Y.
-    sphere::get_sphere_uv(vec3(0, -1, 0), u, v);
+    get_sphere_uv(vec3(0, -1, 0), u, v);
     RT_CHECK_NEAR(v, 0.0, 1e-5);
-    sphere::get_sphere_uv(vec3(0, 1, 0), u, v);
+    get_sphere_uv(vec3(0, 1, 0), u, v);
     RT_CHECK_NEAR(v, 1.0, 1e-5);
 }
 
@@ -298,8 +300,8 @@ TEST(sphere_uv, stays_in_unit_square_over_the_whole_sphere) {
             const vec3 p(std::sin(theta) * std::cos(phi),
                          std::cos(theta),
                          std::sin(theta) * std::sin(phi));
-            double u = -1.0, v = -1.0;
-            sphere::get_sphere_uv(p, u, v);
+            float u = -1.0f, v = -1.0f;
+            get_sphere_uv(p, u, v);
             if (!(u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0)) {
                 RT_FAIL("uv out of range at theta/phi index " + std::to_string(i)
                         + "/" + std::to_string(j));

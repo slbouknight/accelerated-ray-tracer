@@ -12,7 +12,7 @@ see it, because that is the one that tells you *where*.
 
 | tier | file | needs a GPU | runtime | what it protects |
 |---|---|---|---|---|
-| host math | `test_math.cu` | no | ~4 s | `vec3`, `ray`, `aabb`, reflect/refract/schlick, sphere UV, Perlin |
+| host math | `test_math.cpp` | no | <1 s | `vec3`, `ray`, `aabb`, reflect/refract/schlick, sphere UV, Perlin |
 | device | `test_device.cu` | yes | ~1 s | `sphere`/`quad`/`box` intersection, instancing, **BVH vs brute force**, materials, camera |
 | golden image | `run_golden.py` | yes | ~10 s | all ten scenes, end to end |
 
@@ -23,16 +23,23 @@ build\bin\Release\test_device.exe bvh              REM filter by substring
 
 ---
 
-## Tier 1 — host math (`test_math.cu`)
+## Tier 1 — host math (`test_math.cpp`)
 
-Runs on a machine with no CUDA device. Everything it covers is pure float math
-with no cuRAND state, no device-heap allocation and no virtual dispatch, which
-is exactly the set of code that *should* be marked `__host__ __device__`.
+A **plain C++ target** -- not compiled by nvcc, not linked against cudart.
+`src/core/cuda_compat.hpp` defines `__host__`/`__device__` away when nvcc is not
+driving the build, so every header under `src/core` has to be genuinely free of
+device-only constructs. If a `__sinf`, a `curandState` or a device `new` leaks
+into one, this target stops compiling and names the file. The boundary is
+enforced by the build rather than by a comment.
 
-This file being small relative to `test_device.cu` is itself a finding: almost
-nothing in the renderer is currently host-testable, because the geometry and
-material hierarchies are `__device__`-only virtuals built with device `new`.
-Moving scene construction host-side should migrate most of tier 2 into tier 1.
+It is also built with `/W4` (or `-Wall -Wextra`), which the nvcc targets are
+not -- that alone caught an unguarded `#pragma unroll` and two dead
+internal-linkage functions in `aabb.hpp`.
+
+This file being small relative to `test_device.cu` is itself a finding: most of
+the renderer is still not host-testable, because the geometry and material
+hierarchies are `__device__`-only virtuals built with device `new`. Moving scene
+construction host-side should migrate most of tier 2 into tier 1.
 
 ## Tier 2 — device (`test_device.cu`)
 
@@ -116,5 +123,8 @@ TEST(suite_name, what_it_asserts) {
 
 Checks are non-fatal on purpose, so one broken invariant does not hide the five
 behind it. The harness (`test_harness.h`) has no dependencies and compiles with
-both `nvcc` and a plain host C++17 compiler, so these macros port to the
-`serial` branch unchanged.
+both `nvcc` and a plain host C++17 compiler.
+
+Put a test in tier 1 if you can. If the thing under test needs `curandState`,
+device `new`, or virtual dispatch, it has to go in tier 2 — and that is a signal
+worth noticing, not just a routing decision.

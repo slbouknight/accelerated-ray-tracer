@@ -3,10 +3,10 @@
 #include <math.h>
 
 #include "hittable.cuh"
-#include "aabb.cuh"
-#include "ray.cuh"
+#include "../core/aabb.hpp"
+#include "../core/ray.hpp"
 #include "material.cuh"
-#include "vec3.cuh"
+#include "../core/vec3.hpp"
 
 class quad : public hittable 
 {

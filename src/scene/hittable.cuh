@@ -3,8 +3,8 @@
 
 #include <float.h>
 
-#include "aabb.cuh"
-#include "ray.cuh"
+#include "../core/aabb.hpp"
+#include "../core/ray.hpp"
 
 enum HKind : int { HK_Sphere=0, HK_Quad=1, HK_BVH=2, HK_Composite=3};
 
@@ -16,8 +16,10 @@ struct hit_record
     vec3 p;
     vec3 normal;
     material *mat_ptr;
-    double u;
-    double v;
+    // float, not double: these ride in every hit_record, which lives in
+    // registers/local memory for the whole bounce loop.
+    float u;
+    float v;
 };
 
 class hittable

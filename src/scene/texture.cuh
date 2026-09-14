@@ -1,8 +1,8 @@
 #pragma once
 
-#include "image_io.h" // for DeviceImage only
-#include "perlin.cuh"
-#include "vec3.cuh"
+#include "../io/image_io.hpp" // for DeviceImage only
+#include "../core/perlin.hpp"
+#include "../core/vec3.hpp"
 
 __host__ __device__ inline float clamp01(float x){ return x<0?0:x>1?1:x; }
 

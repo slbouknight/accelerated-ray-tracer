@@ -3,7 +3,7 @@
 
 #include <curand_kernel.h>   // for curandState in the overload signature
 #include "hittable.cuh"
-#include "aabb.cuh"
+#include "../core/aabb.hpp"
 
 // Helper to read a component from a vec3 when we only know axis at runtime
 __device__ inline float get_axis(const vec3& v, int axis) {
@@ -91,24 +91,80 @@ public:
 
     // ---- Virtuals required by hittable ----
 
-    // 4-arg legacy hit: real implementation lives here
+    // Maximum traversal stack depth. The tree is built by median split, so its
+    // depth is ~log2(n): 32 covers 4 billion leaves with room to spare. The
+    // array is per-thread local memory, so keeping it small matters.
+    static constexpr int kMaxStack = 32;
+
+    // Iterative traversal with an explicit stack.
+    //
+    // This used to recurse, which cost three things:
+    //   1. Two hit_records per level of stack frame. At depth ~11 that is over
+    //      a kilobyte of *local* memory per ray -- and local memory is global
+    //      memory with a per-thread address, not registers.
+    //   2. A deep per-thread stack reservation, which is why every scene had to
+    //      raise cudaLimitStackSize.
+    //   3. Both children were always fully descended before their results were
+    //      compared, so a hit in the near child could not prune the far one
+    //      until after the far one had already been traversed.
+    //
+    // The loop keeps a single running `closest`, which prunes every subsequent
+    // box test and leaf test as it tightens.
     __device__ bool hit(const ray& r, float tmin, float tmax,
-                        hit_record& rec) const override {
+                        hit_record& rec, curandState* rng) const override {
         if (!box.hit(r, tmin, tmax)) return false;
 
-        hit_record lrec, rrec;
-        const bool hl = left  ? left ->hit(r, tmin, tmax, lrec) : false;
-        const bool hr = right ? right->hit(r, tmin, hl ? lrec.t : tmax, rrec) : false;
+        const hittable* stack[kMaxStack];
+        int sp = 0;
 
-        if (hr) rec = rrec;
-        if (hl && (!hr || lrec.t < rrec.t)) rec = lrec;
-        return hl || hr;
+        const hittable* node = this;
+        float closest = tmax;
+        bool  hit_any = false;
+        hit_record tmp;
+
+        for (;;) {
+            if (node->kind() == HK_BVH) {
+                const bvh_node* b = static_cast<const bvh_node*>(node);
+
+                // A leaf-wrapping node points both children at the same object;
+                // descending twice would test that object twice for no reason.
+                const hittable* l = b->left;
+                const hittable* rgt = (b->right == b->left) ? nullptr : b->right;
+
+                const bool push_l = l   && l->bounding_box().hit(r, tmin, closest);
+                const bool push_r = rgt && rgt->bounding_box().hit(r, tmin, closest);
+
+                if (push_l && push_r) {
+                    if (sp < kMaxStack) stack[sp++] = rgt;
+                    node = l;
+                    continue;
+                }
+                if (push_l) { node = l;   continue; }
+                if (push_r) { node = rgt; continue; }
+            } else {
+                // Leaf: a sphere, quad, box, instance wrapper or volume. The RNG
+                // is threaded through because constant_medium needs it to sample
+                // a free-flight distance -- the old code dropped it here and the
+                // volume fell back to seeding a whole curandState per hit test.
+                if (node->hit(r, tmin, closest, tmp, rng)) {
+                    hit_any = true;
+                    closest = tmp.t;
+                    rec     = tmp;
+                }
+            }
+
+            if (sp == 0) break;
+            node = stack[--sp];
+        }
+
+        return hit_any;
     }
 
-    // 5-arg RNG overload: forward to the 4-arg version (silences partial-override warnings)
+    // 4-arg form: no RNG available. Leaves that need one (constant_medium) fall
+    // back to deriving a local state from the ray.
     __device__ bool hit(const ray& r, float tmin, float tmax,
-                        hit_record& rec, curandState* /*rng*/) const override {
-        return hit(r, tmin, tmax, rec);
+                        hit_record& rec) const override {
+        return hit(r, tmin, tmax, rec, nullptr);
     }
 
     __device__ aabb  bounding_box() const override { return box; }
