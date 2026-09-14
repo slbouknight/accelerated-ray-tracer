@@ -54,6 +54,10 @@ CUDA memory/launch patterns.
 - **Shutter interval sampling**: each ray carries a randomized time in `[time0, time1]`
 - **Animated primitives**: object positions are interpolated across the shutter window
 - Produces natural blur trails when geometry moves during exposure
+
+  > The image below predates the refactor. The scene is unchanged, but its
+  > sphere layout now comes from a host-side RNG seeded by `--seed`, so the
+  > arrangement differs.
 <p align="left">
     <img src="images/utk.png" alt="Motion blur" width="400"/>
 </p>
@@ -73,7 +77,7 @@ CUDA memory/launch patterns.
 </p>
 
 ### Instancing & Object Transforms
-- Translate / rotate geometry without duplicating vertex data
+- Translate / rotate geometry, applied to the primitives at build time rather than by transforming every ray at trace time
 - Used to place rotated blocks in the Cornell Box  
 <p align="left">
   <img src="images/redBlue.png" alt="Instancing" width="400"/>
