@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Benchmark targets. Each entry is one binary to measure.",
+    "",
+    "  style 'cli'    : accepts --scene/--width/--height/--spp/--seed/--out and",
+    "                   writes a --stats JSON. Timings come from cudaEvent, so",
+    "                   they exclude process startup and PPM writing.",
+    "  style 'legacy' : takes no arguments and prints a PPM to stdout. Only the",
+    "                   whole-process wall time can be measured, and the scene",
+    "                   and sample count are whatever it was compiled with, so",
+    "                   the matrix entries are ignored for that target.",
+    "",
+    "To benchmark the serial branch properly rather than as 'legacy', give its",
+    "main.cpp the same five flags and a --stats writer; see bench/README.md.",
+    "",
+    "Build both branches into separate directories so you can point at them at",
+    "the same time:",
+    "  git worktree add ../rt-serial serial",
+    "  cmake -S ../rt-serial -B ../rt-serial/build && cmake --build ../rt-serial/build --config Release"
+  ],
+
+  "baseline": "cuda-release",
+
+  "targets": [
+    {
+      "name": "cuda-release",
+      "label": "cuda-release",
+      "exe": "build/bin/Release/rayTracer.exe",
+      "style": "cli"
+    }
+  ],
+
+  "_disabled_targets_examples": [
+    {
+      "name": "cuda-debug",
+      "label": "cuda-debug",
+      "exe": "build/bin/Debug/rayTracer.exe",
+      "style": "cli",
+      "_note": "Debug CUDA builds use -G (device debug), which disables nearly all optimisation. Expect 10-30x slower. Worth measuring once so you never benchmark Debug by accident again."
+    },
+    {
+      "name": "cuda-block16",
+      "label": "cuda 16x8",
+      "exe": "build/bin/Release/rayTracer.exe",
+      "style": "cli",
+      "extra_args": ["--block", "16", "8"],
+      "_note": "Block-size sweep. 8x8=64 threads gives good 2D locality but low occupancy; try 16x8 and 8x4 too."
+    },
+    {
+      "name": "serial",
+      "label": "serial (cpu)",
+      "exe": "../rt-serial/build/rayTracer.exe",
+      "style": "legacy"
+    }
+  ],
+
+  "matrix": [
+    ["cornell",   400, 400, 200],
+    ["bouncing",  400, 200, 200],
+    ["final",     400, 400, 100],
+    ["quads",     400, 200, 200]
+  ]
+}

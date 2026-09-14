@@ -92,10 +92,13 @@ CUDA memory/launch patterns.
 
 - **Windows** with **Visual Studio 2022** (MSVC toolset)
 - **CUDA Toolkit 12+** (13.x tested)
-- **CMake 3.24+**
-- NVIDIA GPU with supported **compute capability** (current flags target Ada 8.9; adjust for your GPU)
+- **CMake 3.25+**
+- **Python 3** (optional — for the golden-image test and the PPM tools)
+- Any NVIDIA GPU supported by your CUDA toolkit
 
-> If you target a different architecture, set `CMAKE_CUDA_ARCHITECTURES` (or `-gencode` in NVCC flags) appropriately in `CMakeLists.txt`.
+`CMAKE_CUDA_ARCHITECTURES` defaults to `native`, so nvcc targets the GPU it
+finds at configure time. For a portable fat binary, override it:
+`cmake -S . -B build -DRT_CUDA_ARCH="75;86;89;120"`.
 
 ---
 
@@ -103,7 +106,8 @@ CUDA memory/launch patterns.
 
 ### Quick start (Windows)
 
-A helper script automates clean, configure, build, and run. It will prompt for an output name and append `.ppm`:
+Configures, builds **Release**, runs the tests, then prompts for a scene and an
+output name:
 
 ```bat
 setup.bat
@@ -112,33 +116,66 @@ setup.bat
 ### Manual CMake build
 
 ```bat
-rmdir /s /q build
 cmake -S . -B build
-cmake --build build --config Debug
-Build\\bin\\Debug
-RayTracer.exe > output.ppm
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-### Running & output
+> Build **Release**. A Debug CUDA build compiles device code with `-G`, which
+> disables almost all device-side optimisation — useful under `cuda-gdb`, never
+> for timing.
 
-- The renderer writes a **PPM (P3)** image to `stdout`.
+### Running
 
-- Run after building (Debug example):
-  ```bat
-  Build\\bin\\Debug
-  rayTracer.exe > output.ppm
-  ```
+```bat
+build\bin\Release\rayTracer.exe --list
+build\bin\Release\rayTracer.exe --scene cornell --out cornell.ppm
+build\bin\Release\rayTracer.exe --scene original --width 400 --height 400 --spp 500 --out preview.ppm
+```
 
-- Or use the helper script (prompts for a filename and appends `.ppm`):
-  ```bat
-  setup.bat
-  ```
+| flag | meaning |
+|---|---|
+| `--scene NAME` | which scene to render (`--list` to see them) |
+| `--width N` `--height N` | override the scene's default resolution |
+| `--spp N` | samples per pixel |
+| `--max-depth N` | maximum ray bounces (default 50) |
+| `--gamma F` | gamma exponent (default 2.2) |
+| `--seed N` | RNG seed — same seed + same params gives a bit-identical image |
+| `--block X Y` | thread-block dimensions (default `8 8`) |
+| `--batch N` | samples per kernel launch (default 64, `0` = all at once) |
+| `--out FILE` | write here instead of stdout |
+| `--stats FILE` | write timing JSON (`build_ms`, `render_ms`, …) |
+| `--ascii` | emit P3 text PPM instead of P6 binary |
+| `--quiet` | suppress the progress line |
 
-- View/convert the PPM:
-  - **ImageMagick**: `magick convert output.ppm output.png`
-  - **GIMP/Photoshop**: open `output.ppm` directly
+The renderer writes **binary PPM (P6)** by default; `--ascii` gives the P3 text
+form the book uses. Progress and timing go to `stderr`, so `rayTracer.exe
+--scene cornell > out.ppm` still works.
 
-> Scene parameters (resolution `nx/ny`, samples `ns`, camera, aperture, focus distance, and scene generator) live in `src/main.cu`.
+`--batch` exists because Windows kills any kernel that runs longer than the
+display watchdog timeout (TDR, 2 s by default). Issuing the sample budget as
+several short launches is mathematically identical to one long one — the RNG
+state carries across launches — and it gives a progress indicator for free.
+
+### Viewing the output
+
+```bat
+python tools\ppm_to_png.py output.ppm              REM no dependencies
+python tools\ppm_to_png.py output.ppm --scale 4    REM nearest-neighbour zoom
+```
+
+or open the `.ppm` directly in GIMP, or `magick convert output.ppm output.png`.
+
+---
+
+## Testing & benchmarking
+
+```bat
+ctest --test-dir build -C Release --output-on-failure    REM unit + golden image
+python bench\run_bench.py --config bench\targets.json    REM timing matrix
+```
+
+See [tests/README.md](tests/README.md) and [bench/README.md](bench/README.md).
 
 ---
 
@@ -154,11 +191,39 @@ RayTracer.exe > output.ppm
 
 ## Tuning
 
-- **Samples per pixel (spp)**: higher `ns` → cleaner images (time ∝ spp).
-- **Resolution**: increase `nx/ny` for detail.
-- **Max depth**: 50 is a good default; raising it gives diminishing returns.
-- **Aperture**: small (`0.1`) = subtle blur; large (`2.0`) = strong DOF (needs more spp).
-- **Build config**: use **Release** for speed; set `CMAKE_CUDA_ARCHITECTURES` to match your GPU.
+- **Samples per pixel** (`--spp`): higher → cleaner images, time ∝ spp.
+- **Resolution** (`--width`/`--height`): increase for detail.
+- **Max depth** (`--max-depth`): 50 is a good default; raising it gives diminishing returns.
+- **Aperture**: small (`0.1`) = subtle blur; large (`2.0`) = strong DOF (needs more spp). Per-scene, in `src/main.cu`.
+- **Build config**: **Release**, always, for anything you intend to time.
+- **Block size** (`--block`): `8 8` (64 threads) gives good 2D ray coherence but modest occupancy. Sweep it — `16 8` and `8 4` are both worth measuring on your GPU.
+
+---
+
+## Known limitations
+
+Honest list of what the current implementation does badly, in rough order of
+how much it costs:
+
+- **Scene construction runs on one CUDA thread.** `create_world_*` launches as
+  `<<<1,1>>>`, and the BVH build inside it uses an O(n²) selection sort. Measured
+  build times: 10 objects → 21 ms, 488 → 164 ms, 1409 → **1603 ms**. For the
+  `final` scene the BVH build takes longer than a 200×200×8spp render.
+- **Everything is a `__device__` virtual allocated with device `new`.** Objects
+  land scattered across the device malloc heap, so traversal is a pointer chase
+  through uncoalesced global memory, and every `hit()` is an indirect call that
+  cannot inline and serialises when threads in a warp hit different types.
+- **The BVH is built recursively on the device**, which is why every scene has
+  to raise `cudaLimitStackSize` to 16–64 KB. That reservation is per-thread and
+  scales with resident threads, costing both VRAM and occupancy.
+- **`double` on the hot path.** `ray::tm`, `hit_record::u/v` and
+  `camera::time0/time1` are `double`, so `point_at_parameter` promotes to FP64 —
+  which runs at 1/64 rate on a GeForce card.
+- **Instancing wrappers leak.** `translate` and `rotate_y` do not delete the
+  object they wrap, and materials shared between primitives are marked
+  non-owning to avoid a double free, so they are never freed.
+  `compute-sanitizer --leak-check full` reports ~19 leaked allocations for the
+  Cornell scene, and **0 invalid accesses**.
 
 ---
 

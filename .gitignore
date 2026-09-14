@@ -1,8 +1,16 @@
 # Directories
 bin/
 build/
+build-*/
 out/
 .vs/
+
+# Renders and benchmark artefacts. tests/golden/*.ppm is deliberately NOT
+# ignored -- those are committed reference images.
+*.ppm
+!tests/golden/*.ppm
+bench/results*.csv
+bench/results*.json
 
 # Visual Studio build artifacts
 *.sln
@@ -26,3 +34,7 @@ x64/
 
 # VS local settings
 .vs/
+
+# Python
+__pycache__/
+*.pyc

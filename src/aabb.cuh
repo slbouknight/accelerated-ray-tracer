@@ -42,7 +42,9 @@ class aabb
             return aabb(small, big);
         }
 
-        __device__ bool hit(const ray& r, float tmin, float tmax) const 
+        // Pure float math, no curand / no device heap -> dual-compiled so the
+        // slab test can be unit-tested on the host without a GPU.
+        __host__ __device__ bool hit(const ray& r, float tmin, float tmax) const
         {
         for (int a = 0; a < 3; a++) {
             float invD = 1.0f / r.direction()[a];

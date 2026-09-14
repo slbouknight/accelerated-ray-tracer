@@ -17,13 +17,15 @@ __device__ inline vec3 random_in_unit_sphere(curandState* st)
     }
 }
 
-__device__ inline vec3 reflect(const vec3& v, const vec3& n) 
+// reflect / refract / schlick are pure math with no RNG dependency, so they are
+// dual-compiled and covered by the host unit tests.
+__host__ __device__ inline vec3 reflect(const vec3& v, const vec3& n)
 {
     return v - 2.0f * dot(v, n) * n;
 }
 
 // your original style refract (no front_face required)
-__device__ inline bool refract(const vec3& v, const vec3& n, float ni_over_nt, vec3& refracted) 
+__host__ __device__ inline bool refract(const vec3& v, const vec3& n, float ni_over_nt, vec3& refracted)
 {
     vec3 uv = unit_vector(v);
     float dt = dot(uv, n);
@@ -35,7 +37,7 @@ __device__ inline bool refract(const vec3& v, const vec3& n, float ni_over_nt, v
     return false;
 }
 
-__device__ inline float schlick(float cosine, float ref_idx) 
+__host__ __device__ inline float schlick(float cosine, float ref_idx)
 {
     float r0 = (1.0f - ref_idx) / (1.0f + ref_idx);
     r0 = r0 * r0;

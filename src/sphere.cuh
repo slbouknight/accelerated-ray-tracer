@@ -26,8 +26,11 @@ class sphere : public hittable
         }
 
         // Moving sphere -> velocity = cen2 - cen1 (parameterized over [0,1])
-        __device__ sphere(vec3 cen1, vec3 cen2, float r, material* m)
-            : center(ray(cen1, cen2 - cen1, 0.0)), radius(r), mat_ptr(m)
+        // owns_mat MUST be in the init list: without it the flag held whatever
+        // was on the device heap, so ~sphere would delete the material or not
+        // at random -- a double free on some runs and a leak on others.
+        __device__ sphere(vec3 cen1, vec3 cen2, float r, material* m, bool owns=true)
+            : center(ray(cen1, cen2 - cen1, 0.0)), radius(r), mat_ptr(m), owns_mat(owns)
         {
             vec3 rvec(radius, radius, radius);
             vec3 c0 = center.point_at_parameter(0.0);
@@ -39,7 +42,9 @@ class sphere : public hittable
 
         __device__ aabb bounding_box() const override { return bbox; }
 
-        __device__ static void get_sphere_uv(const vec3& p, double& u, double& v)
+        // Static + dual-compiled: callable from host tests without needing to
+        // instantiate the (device-only, polymorphic) sphere itself.
+        __host__ __device__ static void get_sphere_uv(const vec3& p, double& u, double& v)
         {
             auto theta = std::acos(-p.y());
             auto phi = std::atan2(-p.z(), p.x()) + CUDART_PI_F;

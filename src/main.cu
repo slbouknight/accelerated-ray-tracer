@@ -1,10 +1,14 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <curand_kernel.h>
 #include <float.h>
-#include <iostream>
 #include <math.h>
 #include <math_constants.h>
-#include <time.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "bvh.cuh"
 #include "camera.cuh"
@@ -44,6 +48,7 @@ __device__ inline float apply_gamma(float c, float gamma)
 __device__ vec3 color(const ray& r0,
                       const vec3& background,
                       bool gradient_bg,
+                      int max_depth,
                       hittable **world,
                       curandState *local_rand_state)
 {
@@ -51,7 +56,7 @@ __device__ vec3 color(const ray& r0,
     vec3 throughput     = vec3(1,1,1);
     vec3 radiance       = vec3(0,0,0);
 
-    for (int bounce = 0; bounce < 50; ++bounce) 
+    for (int bounce = 0; bounce < max_depth; ++bounce)
     {
         hit_record rec;
         if (!(*world)->hit(cur_ray, 0.001f, FLT_MAX, rec, local_rand_state)) {
@@ -86,27 +91,36 @@ __device__ vec3 color(const ray& r0,
     return radiance;
 }
 
-__global__ void rand_init(curandState *rand_state) 
+__global__ void rand_init(curandState *rand_state, unsigned long long seed)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        curand_init(1984, 0, 0, rand_state);
+        curand_init(seed, 0, 0, rand_state);
     }
 }
 
-__global__ void render_init(int max_x, int max_y, curandState *rand_state)
+__global__ void render_init(int max_x, int max_y, curandState *rand_state,
+                            unsigned long long seed)
 {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if((i >= max_x) || (j >= max_y)) return;
     int pixel_index = j*max_x + i;
 
-    // Same seed for each thread
-    curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
+    // Distinct seed per pixel rather than distinct *sequence*. curand_init with
+    // a sequence number does a 2^67 skip-ahead, which is far more expensive;
+    // varying the seed is the pragmatic choice the NVIDIA blog made too. The
+    // streams are only statistically independent, not provably so.
+    curand_init(seed + pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, int ns, float gamma,
-                       camera **cam, hittable **world, curandState *rand_state,
-                       vec3 background, int use_gradient_bg)
+// Accumulates `ns` samples into `accum` *without* normalising or gamma-encoding.
+// Splitting accumulation from resolve is what lets the host issue the sample
+// budget in batches: several short launches instead of one multi-minute kernel
+// that Windows' display watchdog (TDR, 2s by default) would kill.
+__global__ void render_accumulate(vec3 *accum, int max_x, int max_y, int ns,
+                                  int max_depth, camera **cam, hittable **world,
+                                  curandState *rand_state,
+                                  vec3 background, int use_gradient_bg)
 {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -116,20 +130,38 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, float gamma,
     curandState local_rand_state = rand_state[pixel_index];
 
     vec3 col(0,0,0);
-    for (int s = 0; s < ns; s++) 
+    for (int s = 0; s < ns; s++)
     {
         float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
         float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
         ray r = (*cam)->get_ray(u, v, &local_rand_state);
-        col += color(r, background, use_gradient_bg != 0, world, &local_rand_state);
+        col += color(r, background, use_gradient_bg != 0, max_depth, world, &local_rand_state);
     }
     rand_state[pixel_index] = local_rand_state;
 
-    col /= float(ns);
+    accum[pixel_index] += col;
+}
+
+// Normalise by the total sample count and gamma-encode, once, at the end.
+__global__ void resolve(vec3 *fb, const vec3 *accum, int max_x, int max_y,
+                        int total_samples, float gamma)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    if ((i >= max_x) || (j >= max_y)) return;
+
+    int pixel_index = j*max_x + i;
+    vec3 col = accum[pixel_index] / float(total_samples);
     col[0] = apply_gamma(col[0], gamma);
     col[1] = apply_gamma(col[1], gamma);
     col[2] = apply_gamma(col[2], gamma);
     fb[pixel_index] = col;
+}
+
+__global__ void clear_buffer(vec3 *buf, int n)
+{
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) buf[i] = vec3(0,0,0);
 }
 
 // ----- Configurable scene parameters -----
@@ -158,7 +190,7 @@ __device__ inline vec3 pick_ut_color(float r) {
 }
 
 __global__ void create_world_bouncing(hittable **d_list, hittable **d_world, camera **d_camera,
-                             int nx, int ny, curandState *rand_state)
+                             int nx, int ny, curandState *rand_state, int *d_count)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
@@ -227,6 +259,10 @@ __global__ void create_world_bouncing(hittable **d_list, hittable **d_world, cam
         d_list[i++] = new sphere(vec3( 4.0f, 1.0f,  0.0f), 1.0f, new metal(vec3(0.7f, 0.6f, 0.5f), 0.0f));
 
         *rand_state = local_rand_state;
+        // Report how many leaves were actually written. The host allocates
+        // capacity, but only this many slots are initialised -- freeing past
+        // here would delete uninitialised device memory.
+        *d_count = i;
         *d_world = new bvh_node(d_list, 0, i);
 
         // Camera — add shutter times [0,1]
@@ -244,7 +280,7 @@ __global__ void create_world_bouncing(hittable **d_list, hittable **d_world, cam
 }
 
 __global__ void create_world_checker(hittable **d_list, hittable **d_world, camera **d_camera,
-                                     int nx, int ny, curandState *rand_state)
+                                     int nx, int ny, curandState *rand_state, int *d_count)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         // (RNG not strictly needed here, but keep the pattern)
@@ -258,9 +294,18 @@ __global__ void create_world_checker(hittable **d_list, hittable **d_world, came
         material* lam = new lambertian(checker);
 
         // Two big spheres (y = ±10), like the book’s “checkered_spheres”
-        d_list[i++] = new sphere(vec3(0,-10,0), 10.0f, lam);
-        d_list[i++] = new sphere(vec3(0, 10,0), 10.0f, lam);
+      // NOTE: owns=false. This material is shared by several primitives and
+        // each ~sphere/~quad would otherwise delete it, so the first teardown
+        // frees it and the rest double-free. Ownership moves to a flat,
+        // host-side material table in the refactor; until then it leaks once
+        // at exit, which is strictly better than corrupting the device heap.
+        d_list[i++] = new sphere(vec3(0,-10,0), 10.0f, lam, /*owns=*/false);
+        d_list[i++] = new sphere(vec3(0, 10,0), 10.0f, lam, /*owns=*/false);
 
+        // Report how many leaves were actually written. The host allocates
+        // capacity, but only this many slots are initialised -- freeing past
+        // here would delete uninitialised device memory.
+        *d_count = i;
         *d_world = new bvh_node(d_list, 0, i);
 
         // Camera (pinhole)
@@ -280,7 +325,7 @@ __global__ void create_world_checker(hittable **d_list, hittable **d_world, came
 }
 
 __global__ void create_world_earth(hittable **d_list, hittable **d_world, camera **d_camera,
-                                   int nx, int ny, DeviceImage earth_img)
+                                   int nx, int ny, DeviceImage earth_img, int *d_count)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         int i = 0;
@@ -291,6 +336,10 @@ __global__ void create_world_earth(hittable **d_list, hittable **d_world, camera
         d_list[i++] = new sphere(vec3(0,0,0), 2.0f, earth_lam);
 
         // Wrap in BVH (okay even for 1 object, matches your other scenes)
+        // Report how many leaves were actually written. The host allocates
+        // capacity, but only this many slots are initialised -- freeing past
+        // here would delete uninitialised device memory.
+        *d_count = i;
         *d_world = new bvh_node(d_list, 0, i);
 
         // Camera (pinhole)
@@ -308,7 +357,7 @@ __global__ void create_world_earth(hittable **d_list, hittable **d_world, camera
 }
 
 __global__ void create_world_perlin(hittable **d_list, hittable **d_world, camera **d_camera,
-                                    int nx, int ny, float scale)
+                                    int nx, int ny, float scale, int *d_count)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         int i = 0;
@@ -316,9 +365,18 @@ __global__ void create_world_perlin(hittable **d_list, hittable **d_world, camer
         texture* pertext = new noise_texture(scale);
         material* lam    = new lambertian(pertext);
 
-        d_list[i++] = new sphere(vec3(0,-1000,0), 1000.f, lam);
-        d_list[i++] = new sphere(vec3(0,     2,0),    2.f, lam);
+      // NOTE: owns=false. This material is shared by several primitives and
+        // each ~sphere/~quad would otherwise delete it, so the first teardown
+        // frees it and the rest double-free. Ownership moves to a flat,
+        // host-side material table in the refactor; until then it leaks once
+        // at exit, which is strictly better than corrupting the device heap.
+        d_list[i++] = new sphere(vec3(0,-1000,0), 1000.f, lam, /*owns=*/false);
+        d_list[i++] = new sphere(vec3(0,     2,0),    2.f, lam, /*owns=*/false);
 
+        // Report how many leaves were actually written. The host allocates
+        // capacity, but only this many slots are initialised -- freeing past
+        // here would delete uninitialised device memory.
+        *d_count = i;
         *d_world = new bvh_node(d_list, 0, i);
 
         vec3 lookfrom(13,2,3), lookat(0,0,0), vup(0,1,0);
@@ -329,7 +387,7 @@ __global__ void create_world_perlin(hittable **d_list, hittable **d_world, camer
 }
 
 __global__ void create_world_quads(hittable **d_list, hittable **d_world, camera **d_camera,
-                                   int nx, int ny)
+                                   int nx, int ny, int *d_count)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         int i = 0;
@@ -348,6 +406,10 @@ __global__ void create_world_quads(hittable **d_list, hittable **d_world, camera
         d_list[i++] = new quad(vec3(-2, 3, 1), vec3(4, 0, 0), vec3(0, 0, 4), upper_orange);
         d_list[i++] = new quad(vec3(-2,-3, 5), vec3(4, 0, 0), vec3(0, 0,-4), lower_teal);
 
+        // Report how many leaves were actually written. The host allocates
+        // capacity, but only this many slots are initialised -- freeing past
+        // here would delete uninitialised device memory.
+        *d_count = i;
         *d_world = new bvh_node(d_list, 0, i);
 
         vec3 lookfrom(0,0,9), lookat(0,0,0), vup(0,1,0);
@@ -358,7 +420,7 @@ __global__ void create_world_quads(hittable **d_list, hittable **d_world, camera
 }
 
 __global__ void create_world_simple_light(hittable **d_list, hittable **d_world, camera **d_camera,
-                                          int nx, int ny, DeviceImage ball_img)
+                                          int nx, int ny, DeviceImage ball_img, int *d_count)
 {
     if (threadIdx.x || blockIdx.x) return;
     int i = 0;
@@ -388,6 +450,10 @@ __global__ void create_world_simple_light(hittable **d_list, hittable **d_world,
     d_list[i++] = new sphere(vec3(0,7,0), 2.f,  light1);
     d_list[i++] = new quad  (vec3(3,1,-2), vec3(2,0,0), vec3(0,2,0), light2);
 
+    // Report how many leaves were actually written. The host allocates
+    // capacity, but only this many slots are initialised -- freeing past
+    // here would delete uninitialised device memory.
+    *d_count = i;
     *d_world = new bvh_node(d_list, 0, i);
 
     // Camera
@@ -400,7 +466,7 @@ __global__ void create_world_simple_light(hittable **d_list, hittable **d_world,
 }
 
 __global__ void create_world_cornell(hittable **d_list, hittable **d_world, camera **d_camera,
-                                     int nx, int ny)
+                                     int nx, int ny, int *d_count)
 {
     if (threadIdx.x || blockIdx.x) return;
     int i = 0;
@@ -414,9 +480,14 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
     // Cornell walls (inward-facing quads)
     d_list[i++] = new quad(vec3(0,0,0),       vec3(0,555,0),  vec3(0,0,555),  blue,  true); // left
     d_list[i++] = new quad(vec3(555,0,555),   vec3(0,555,0),  vec3(0,0,-555), red,    true); // right
-    d_list[i++] = new quad(vec3(0,0,0),       vec3(555,0,0),  vec3(0,0,555),  white,  true); // floor
-    d_list[i++] = new quad(vec3(0,555,555),   vec3(555,0,0),  vec3(0,0,-555), white,  true); // ceiling
-    d_list[i++] = new quad(vec3(555,0,555),   vec3(-555,0,0), vec3(0,555,0),  white,  true); // back
+  // NOTE: owns=false. This material is shared by several primitives and
+  // each ~sphere/~quad would otherwise delete it, so the first teardown
+  // frees it and the rest double-free. Ownership moves to a flat,
+  // host-side material table in the refactor; until then it leaks once
+  // at exit, which is strictly better than corrupting the device heap.
+    d_list[i++] = new quad(vec3(0,0,0),       vec3(555,0,0),  vec3(0,0,555),  white,  true, false); // floor
+    d_list[i++] = new quad(vec3(0,555,555),   vec3(555,0,0),  vec3(0,0,-555), white,  true, false); // ceiling
+    d_list[i++] = new quad(vec3(555,0,555),   vec3(-555,0,0), vec3(0,555,0),  white,  true, false); // back
     d_list[i++] = new quad(vec3(213,554,227), vec3(130,0,0),  vec3(0,0,105),  light,  true); // light
 
     // ---- Instanced boxes ----
@@ -433,11 +504,15 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
 
     // Place it toward the front center so it doesn't intersect boxes or the ceiling light
     // Cornell is 555³; this puts the center ~185 units up, radius 60
-    d_list[i++] = new sphere(vec3(278.f, 335.f, 150.f), 60.f, glass);
+    d_list[i++] = new sphere(vec3(278.f, 335.f, 150.f), 60.f, glass, /*owns=*/false);
 
     // make it a *hollow* glass bubble with a thin shell:
-    d_list[i++] = new sphere(vec3(278.f, 335.f, 150.f), -59.0f, glass);
+    d_list[i++] = new sphere(vec3(278.f, 335.f, 150.f), -59.0f, glass, /*owns=*/false);
 
+    // Report how many leaves were actually written. The host allocates
+    // capacity, but only this many slots are initialised -- freeing past
+    // here would delete uninitialised device memory.
+    *d_count = i;
     *d_world = new bvh_node(d_list, 0, i);
 
     // Camera
@@ -450,7 +525,7 @@ __global__ void create_world_cornell(hittable **d_list, hittable **d_world, came
 }
 
 __global__ void create_world_cornell_smoke(hittable **d_list, hittable **d_world, camera **d_camera,
-                                           int nx, int ny) {
+                                           int nx, int ny, int *d_count) {
     if (threadIdx.x || blockIdx.x) return;
     int i = 0;
 
@@ -462,9 +537,14 @@ __global__ void create_world_cornell_smoke(hittable **d_list, hittable **d_world
     // Walls (inward-facing)
     d_list[i++] = new quad(vec3(555,0,0),   vec3(0,555,0),  vec3(0,0,555),  green, true);
     d_list[i++] = new quad(vec3(0,0,0),     vec3(0,555,0),  vec3(0,0,555),  red,   true);
-    d_list[i++] = new quad(vec3(0,555,0),   vec3(555,0,0),  vec3(0,0,555),  white, true);
-    d_list[i++] = new quad(vec3(0,0,0),     vec3(555,0,0),  vec3(0,0,555),  white, true);
-    d_list[i++] = new quad(vec3(0,0,555),   vec3(555,0,0),  vec3(0,555,0),  white, true);
+  // NOTE: owns=false. This material is shared by several primitives and
+  // each ~sphere/~quad would otherwise delete it, so the first teardown
+  // frees it and the rest double-free. Ownership moves to a flat,
+  // host-side material table in the refactor; until then it leaks once
+  // at exit, which is strictly better than corrupting the device heap.
+    d_list[i++] = new quad(vec3(0,555,0),   vec3(555,0,0),  vec3(0,0,555),  white, true, false);
+    d_list[i++] = new quad(vec3(0,0,0),     vec3(555,0,0),  vec3(0,0,555),  white, true, false);
+    d_list[i++] = new quad(vec3(0,0,555),   vec3(555,0,0),  vec3(0,555,0),  white, true, false);
     d_list[i++] = new quad(vec3(113,554,127), vec3(330,0,0), vec3(0,0,305), light, true);
 
     // Two boxes -> rotate/translate -> wrap each in constant_medium
@@ -476,6 +556,10 @@ __global__ void create_world_cornell_smoke(hittable **d_list, hittable **d_world
     d_list[i++] = new constant_medium(b1, 0.01f, vec3(0.5,0.5,0.5)); // black smoke
     d_list[i++] = new constant_medium(b2, 0.01f, vec3(1,1,1)); // white smoke
 
+    // Report how many leaves were actually written. The host allocates
+    // capacity, but only this many slots are initialised -- freeing past
+    // here would delete uninitialised device memory.
+    *d_count = i;
     *d_world = new bvh_node(d_list, 0, i);
 
     // Camera
@@ -496,7 +580,7 @@ __device__ inline vec3 rotate_y_deg(const vec3& p, float deg) {
 }
 
 __global__ void create_world_final(hittable **d_list, hittable **d_world, camera **d_camera,
-                                   int nx, int ny, DeviceImage earth_img) {
+                                   int nx, int ny, DeviceImage earth_img, int *d_count) {
     if (threadIdx.x || blockIdx.x) return;
 
     int i = 0;
@@ -548,9 +632,14 @@ __global__ void create_world_final(hittable **d_list, hittable **d_world, camera
     {
         vec3 p = random_in_unit_cube(j) * 165.0f;   // see note below
         p = rotate_y_deg(p, 15.0f) + vec3(-100, 270, 395);  // match CPU scene
-        d_list[i++] = new sphere(p, 10.0f, white);
+        // owns=false: all 1000 spheres share one material (see note above).
+        d_list[i++] = new sphere(p, 10.0f, white, /*owns=*/false);
     }
 
+    // Report how many leaves were actually written. The host allocates
+    // capacity, but only this many slots are initialised -- freeing past
+    // here would delete uninitialised device memory.
+    *d_count = i;
     *d_world = new bvh_node(d_list, 0, i);
 
     // Camera
@@ -562,7 +651,7 @@ __global__ void create_world_final(hittable **d_list, hittable **d_world, camera
 }
 
 __global__ void create_world_original(hittable **d_list, hittable **d_world, camera **d_camera,
-                                   int nx, int ny, DeviceImage earth_img, DeviceImage ball_img) {
+                                   int nx, int ny, DeviceImage earth_img, DeviceImage ball_img, int *d_count) {
     if (threadIdx.x || blockIdx.x) return;
 
     int i = 0;
@@ -621,9 +710,14 @@ __global__ void create_world_original(hittable **d_list, hittable **d_world, cam
     {
         vec3 p = random_in_unit_cube(j) * 165.0f;   // see note below
         p = rotate_y_deg(p, 15.0f) + vec3(-100, 270, 395);  // match CPU scene
-        d_list[i++] = new sphere(p, 10.0f, white);
+        // owns=false: all 1000 spheres share one material (see note above).
+        d_list[i++] = new sphere(p, 10.0f, white, /*owns=*/false);
     }
 
+    // Report how many leaves were actually written. The host allocates
+    // capacity, but only this many slots are initialised -- freeing past
+    // here would delete uninitialised device memory.
+    *d_count = i;
     *d_world = new bvh_node(d_list, 0, i);
 
     // Camera
@@ -633,690 +727,439 @@ __global__ void create_world_original(hittable **d_list, hittable **d_world, cam
                            0.0f, (lookfrom-lookat).length(),
                            0.0, 1.0);
 }
-
 __global__ void free_world(hittable **d_list, int count,
                            hittable **d_world,
                            camera   **d_camera)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        // 1) Delete all leaves (their virtual dtors free owned materials)
+        // Order matters. ~bvh_node decides whether to recurse by calling the
+        // virtual kind() on each child:
+        //
+        //     if (left && left->kind() == HK_BVH) delete left;
+        //
+        // so every leaf must still be alive when the tree is torn down. Freeing
+        // the leaves first (as this kernel used to) reads a vtable pointer out
+        // of freed device memory -- a use-after-free that surfaces as
+        // cudaErrorInvalidPc, and only when the heap happens to get reused.
+        //
+        // 1) BVH internal nodes, while the leaves they point at are still valid.
+        delete *d_world;
+
+        // 2) Now the leaves, whose dtors free any material they own.
         for (int i = 0; i < count; ++i)
             delete d_list[i];
 
-        // 2) Delete BVH internal nodes (dtor skips leaves by design)
-        delete *d_world;
-
-        // 3) Delete camera
+        // 3) Camera.
         delete *d_camera;
     }
 }
 
-void bouncing_spheres()
+// ===========================================================================
+// Scene table
+// ===========================================================================
+//
+// Every scene used to carry its own 70-line copy of the same allocate / build /
+// render / print / free sequence. The duplication is where the leaks lived: the
+// second cuRAND state was freed in three of ten copies, two scenes loaded the
+// same texture twice and leaked the first upload, and two passed a `count` to
+// free_world that did not match what the builder had written.
+//
+// The parameters below are the per-scene values from those original functions,
+// carried over unchanged so existing renders reproduce.
+
+enum SceneId {
+    SCENE_BOUNCING = 0, SCENE_CHECKERED, SCENE_EARTH, SCENE_PERLIN, SCENE_QUADS,
+    SCENE_SIMPLE_LIGHT, SCENE_CORNELL, SCENE_CORNELL_SMOKE, SCENE_FINAL,
+    SCENE_ORIGINAL, SCENE_COUNT
+};
+
+struct SceneSpec {
+    SceneId     id;
+    const char* name;
+    int         width, height, spp;
+    vec3        background;
+    int         gradient_bg;       // 1 -> sky gradient on miss, 0 -> flat background
+    int         capacity;          // d_list slots to allocate
+    size_t      stack_bytes;
+    size_t      heap_bytes;
+    const char* texture_a;         // nullptr when the scene needs no image texture
+    const char* texture_b;
+};
+
+static const SceneSpec kScenes[SCENE_COUNT] = {
+  // id                   name             W     H     spp   background                      grad  cap   stack   heap         tex_a                    tex_b
+  { SCENE_BOUNCING,      "bouncing",      1200,  600, 10000, vec3(0,0,0),                     0,   512,  16384,  64u<<20,  nullptr,                  nullptr },
+  { SCENE_CHECKERED,     "checkered",     1200,  600,   500, vec3(0,0,0),                     1,     8,  16384,  64u<<20,  nullptr,                  nullptr },
+  { SCENE_EARTH,         "earth",         1200,  600,   500, vec3(0,0,0),                     1,     8,  16384,  64u<<20,  "textures/earthmap.jpg",  nullptr },
+  { SCENE_PERLIN,        "perlin",        1200,  600,   500, vec3(0,0,0),                     1,     8,  16384,  64u<<20,  nullptr,                  nullptr },
+  { SCENE_QUADS,         "quads",         1200,  600,   500, vec3(0,0,0),                     1,    16,  16384,  64u<<20,  nullptr,                  nullptr },
+  // capacity 16, not the original 4: the builder writes 5 leaves (ground, ball
+  // core, clear coat, light sphere, light quad) into what was a 4-slot array.
+  { SCENE_SIMPLE_LIGHT,  "simple_light",  1200,  600, 10000, vec3(0,0,0),                     0,    16,  16384,  64u<<20,  "textures/poolball.jpg",  nullptr },
+  // capacity 16, not the original 6: the builder writes 10 (6 walls, 2 boxes,
+  // 2 spheres). Both of these were out-of-bounds device writes.
+  { SCENE_CORNELL,       "cornell",        600,  600, 10000, vec3(0,0,0),                     0,    16,  16384,  64u<<20,  nullptr,                  nullptr },
+  { SCENE_CORNELL_SMOKE, "cornell_smoke",  600,  600,  1000, vec3(0,0,0),                     0,    16,  65536, 256u<<20,  nullptr,                  nullptr },
+  { SCENE_FINAL,         "final",          800,  800, 10000, vec3(0,0,0),                     0,  1800,  32768, 256u<<20,  "textures/earthmap.jpg",  nullptr },
+  { SCENE_ORIGINAL,      "original",       800,  800, 10000, vec3(0.043f,0.030f,0.094f),      0,  1800,  32768, 256u<<20,  "textures/porcelain.jpg", "textures/8ball.jpg" },
+};
+
+static void launch_scene_builder(const SceneSpec& spec,
+                                 hittable **d_list, hittable **d_world, camera **d_camera,
+                                 int nx, int ny, curandState *d_rand_state2,
+                                 DeviceImage tex_a, DeviceImage tex_b, int *d_count)
 {
-    int nx = 1200;
-    int ny = 600;
-    int ns = 10000;
-    float gamma = 2.2f;
-    int tx = 8;
-    int ty = 8;
+    switch (spec.id) {
+        case SCENE_BOUNCING:
+            create_world_bouncing<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2, d_count); break;
+        case SCENE_CHECKERED:
+            create_world_checker<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2, d_count); break;
+        case SCENE_EARTH:
+            create_world_earth<<<1,1>>>(d_list, d_world, d_camera, nx, ny, tex_a, d_count); break;
+        case SCENE_PERLIN:
+            create_world_perlin<<<1,1>>>(d_list, d_world, d_camera, nx, ny, /*scale=*/4.0f, d_count); break;
+        case SCENE_QUADS:
+            create_world_quads<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_count); break;
+        case SCENE_SIMPLE_LIGHT:
+            create_world_simple_light<<<1,1>>>(d_list, d_world, d_camera, nx, ny, tex_a, d_count); break;
+        case SCENE_CORNELL:
+            create_world_cornell<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_count); break;
+        case SCENE_CORNELL_SMOKE:
+            create_world_cornell_smoke<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_count); break;
+        case SCENE_FINAL:
+            create_world_final<<<1,1>>>(d_list, d_world, d_camera, nx, ny, tex_a, d_count); break;
+        case SCENE_ORIGINAL:
+            create_world_original<<<1,1>>>(d_list, d_world, d_camera, nx, ny, tex_a, tex_b, d_count); break;
+        default: break;
+    }
+}
 
-    // Increase per thread call stack size and device heap
-    // Temporary workaround since bvh is still recursive 
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);        // 16 KB
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024); // 64 MB device heap
+// ===========================================================================
+// Command line
+// ===========================================================================
 
-    std::cerr << "Rendering a " << nx << "x" << ny << " image ";
-    std::cerr << "in " << tx << "x" << ty << " blocks.\n";
+struct Options {
+    int          scene       = SCENE_ORIGINAL;
+    int          width       = -1;      // -1 -> take the scene default
+    int          height      = -1;
+    int          spp         = -1;
+    int          max_depth   = 50;      // was hard-coded in color()
+    float        gamma       = 2.2f;
+    unsigned long long seed  = 1984;
+    int          tx          = 8;
+    int          ty          = 8;
+    int          batch       = 64;      // samples per kernel launch; see below
+    std::string  out;                   // empty -> stdout
+    std::string  stats;                 // empty -> no machine-readable stats
+    bool         binary     = true;     // P6 by default; --ascii for P3
+    bool         quiet      = false;
+    bool         list       = false;
+};
 
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
+static void usage(const char* argv0) {
+    std::fprintf(stderr,
+      "usage: %s [options]\n"
+      "\n"
+      "  --scene NAME       scene to render (default: original, --list to see all)\n"
+      "  --width N          override image width\n"
+      "  --height N         override image height\n"
+      "  --spp N            samples per pixel\n"
+      "  --max-depth N      maximum ray bounces (default 50)\n"
+      "  --gamma F          gamma exponent (default 2.2)\n"
+      "  --seed N           RNG seed; identical seed + params => identical image\n"
+      "  --block X Y        thread block dimensions (default 8 8)\n"
+      "  --batch N          samples per kernel launch (default 64, 0 = all at once)\n"
+      "  --out FILE         write PPM here instead of stdout\n"
+      "  --stats FILE       write timing JSON here\n"
+      "  --ascii            emit P3 text PPM instead of P6 binary\n"
+      "  --quiet            suppress progress output\n"
+      "  --list             list scene names and their defaults\n", argv0);
+}
 
-    // Allocate frame buffer
-    vec3 *fb;
-    checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-
-    // Allocate random state
-    curandState *d_rand_state;
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2;
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-
-    // we need that 2nd random state to be initialized for the world creation
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    // Make camera and world with hittables
-    camera **d_camera;
-    checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    hittable **d_list;
-    int num_hitables = 22*22 + 1 + 3;
-    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hittable *)));
-    hittable **d_world;
-    checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-    create_world_bouncing<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    clock_t start, stop;
-    start = clock();
-    // Render buffer
-    dim3 blocks(nx/tx+1, ny/ty+1);
-    dim3 threads(tx, ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny,  ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 0);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-    stop = clock();
-    double timer_seconds = ((double(stop - start)) / CLOCKS_PER_SEC);
-    std::cerr << "took " << timer_seconds << " seconds.\n";
-
-    // Output frame buffer as image
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-
-    for (int j = ny-1; j >= 0; j--)
-    {
-        for (int i = 0; i < nx; i++)
-        {
-            size_t pixel_index = j*nx + i;
-            int ir = int(255.99*fb[pixel_index].r());
-            int ig = int(255.99*fb[pixel_index].g());
-            int ib = int(255.99*fb[pixel_index].b());
-            std::cout << ir << " " << ig << " " << ib << "\n";
+static bool parse_args(int argc, char** argv, Options* o) {
+    auto need = [&](int i, const char* what) {
+        if (i >= argc) { std::fprintf(stderr, "error: %s requires a value\n", what); return false; }
+        return true;
+    };
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if      (a == "--list")  { o->list = true; }
+        else if (a == "--quiet") { o->quiet = true; }
+        else if (a == "--ascii") { o->binary = false; }
+        else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
+        else if (a == "--scene") {
+            if (!need(++i, "--scene")) return false;
+            bool found = false;
+            for (int s = 0; s < SCENE_COUNT; ++s)
+                if (std::strcmp(kScenes[s].name, argv[i]) == 0) { o->scene = s; found = true; break; }
+            if (!found) { std::fprintf(stderr, "error: unknown scene '%s' (try --list)\n", argv[i]); return false; }
         }
-    }
-    
-    // Clean up
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-
-    // Useful for cuda-memcheck --leak-check full
-    cudaDeviceReset();
-}
-
-int checkered_spheres() {
-    int nx = 1200, ny = 600, ns = 500;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
-
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
-
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-
-    vec3 *fb;                      checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-    curandState *d_rand_state;     checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2;    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    camera **d_camera;             checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    int num_hitables = 2;          // two big spheres
-    hittable **d_list;             checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hittable *)));
-    hittable **d_world;            checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-
-    create_world_checker<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
-        size_t k = j*nx + i;
-        int ir = int(255.99f*fb[k].r());
-        int ig = int(255.99f*fb[k].g());
-        int ib = int(255.99f*fb[k].b());
-        std::cout << ir << " " << ig << " " << ib << "\n";
-    }
-
-    // --- Clean up ---
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-    cudaDeviceReset();
-    return 0;
-}
-
-int earth() {
-    // Render params (match your other scenes)
-    int nx = 1200;
-    int ny = 600;
-    int ns = 500;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
-
-    // Device limits (you already do this elsewhere too)
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
-
-    // Load earth texture on HOST, upload to device
-    unsigned char* d_pixels = nullptr;
-    DeviceImage earth_img   = load_image_to_device("textures/earthmap.jpg", &d_pixels);
-    if (!earth_img.valid()) {
-        std::cerr << "Failed to load earthmap.jpg\n";
-        return 1;
-    }
-
-    // Framebuffer
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-
-    // RNG
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    // Scene allocations
-    camera **d_camera; checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    int num_hitables = 1;       // just the globe
-    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables * sizeof(hittable *)));
-    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-
-    // Build world on device
-    create_world_earth<<<1,1>>>(d_list, d_world, d_camera, nx, ny, earth_img);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // Render
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // Output PPM
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) {
-        for (int i = 0; i < nx; ++i) {
-            size_t k = j*nx + i;
-            int ir = int(255.99f*fb[k].r());
-            int ig = int(255.99f*fb[k].g());
-            int ib = int(255.99f*fb[k].b());
-            std::cout << ir << " " << ig << " " << ib << "\n";
+        else if (a == "--width")     { if (!need(++i, "--width")) return false;     o->width = std::atoi(argv[i]); }
+        else if (a == "--height")    { if (!need(++i, "--height")) return false;    o->height = std::atoi(argv[i]); }
+        else if (a == "--spp")       { if (!need(++i, "--spp")) return false;       o->spp = std::atoi(argv[i]); }
+        else if (a == "--max-depth") { if (!need(++i, "--max-depth")) return false; o->max_depth = std::atoi(argv[i]); }
+        else if (a == "--gamma")     { if (!need(++i, "--gamma")) return false;     o->gamma = (float)std::atof(argv[i]); }
+        else if (a == "--seed")      { if (!need(++i, "--seed")) return false;      o->seed = std::strtoull(argv[i], nullptr, 10); }
+        else if (a == "--batch")     { if (!need(++i, "--batch")) return false;     o->batch = std::atoi(argv[i]); }
+        else if (a == "--out")       { if (!need(++i, "--out")) return false;       o->out = argv[i]; }
+        else if (a == "--stats")     { if (!need(++i, "--stats")) return false;     o->stats = argv[i]; }
+        else if (a == "--block") {
+            if (!need(++i, "--block")) return false; o->tx = std::atoi(argv[i]);
+            if (!need(++i, "--block")) return false; o->ty = std::atoi(argv[i]);
         }
+        else { std::fprintf(stderr, "error: unknown option '%s'\n", a.c_str()); usage(argv[0]); return false; }
     }
-
-    // Cleanup
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-
-    // Free device pixels for the earth texture
-    free_device_image(earth_img);
-
-    cudaDeviceReset();
-    return 0;
+    return true;
 }
 
-int perlin() {
-    int nx = 1200, ny = 600, ns = 500;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
+// ===========================================================================
+// Output
+// ===========================================================================
 
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
-
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-
-    vec3 *fb;                      checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-    curandState *d_rand_state;     checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2;    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    camera **d_camera;             checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    int num_hitables = 2;          // ground + sphere
-    hittable **d_list;             checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables * sizeof(hittable *)));
-    hittable **d_world;            checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-
-    const float scale = 4.0f;      // tweak to taste (like the book)
-    create_world_perlin<<<1,1>>>(d_list, d_world, d_camera, nx, ny, scale);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
-        size_t k = j*nx + i;
-        int ir = int(255.99f*fb[k].r());
-        int ig = int(255.99f*fb[k].g());
-        int ib = int(255.99f*fb[k].b());
-        std::cout << ir << " " << ig << " " << ib << "\n";
-    }
-
-    // --- Clean up ---
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-    cudaDeviceReset();
-    return 0;
-}
-
-int quads_scene() {
-    int nx = 1200, ny = 600, ns = 500;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
-
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
-
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-
-    vec3 *fb;                   checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void**)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void**)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    camera **d_camera; checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
-    int num_hitables = 5;
-    hittable **d_list; checkCudaErrors(cudaMalloc((void**)&d_list,  num_hitables*sizeof(hittable*)));
-    hittable **d_world;checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hittable*)));
-
-    create_world_quads<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx, ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 1);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
-        size_t k = j*nx + i;
-        int ir = int(255.99f*fb[k].r());
-        int ig = int(255.99f*fb[k].g());
-        int ib = int(255.99f*fb[k].b());
-        std::cout << ir << " " << ig << " " << ib << "\n";
-    }
-
-    // --- Clean up ---
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-    cudaDeviceReset();
-    return 0;
-}
-
-int simple_light() 
+// The original wrote P3 with one std::cout insertion per channel: about 2.1M
+// formatted stream writes for a 1200x600 frame, which took longer than some of
+// the renders. P6 is the same image as a single fwrite.
+static bool write_ppm(const char* path, bool binary, const vec3* fb, int nx, int ny)
 {
-    // image / render params
-    int nx = 1200;
-    int ny = 600;
-    int ns = 10000;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
+    std::FILE* f = path ? std::fopen(path, binary ? "wb" : "w") : stdout;
+    if (!f) { std::fprintf(stderr, "error: cannot open '%s' for writing\n", path); return false; }
 
-    // device limits (same as your other scenes)
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
+    // Row 0 of the framebuffer is the *bottom* of the image, so emit rows in
+    // reverse to match PPM's top-to-bottom order.
+    auto quantise = [](float c) -> unsigned char {
+        const int v = (int)(255.99f * c);
+        return (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    };
 
-    // Load ball texture on HOST, upload to device
-    unsigned char* d_pixels = nullptr;
-    DeviceImage ball_img   = load_image_to_device("textures/poolball.jpg", &d_pixels);
-    if (!ball_img.valid()) {
-        std::cerr << "Failed to load poolball.jpg\n";
-        return 1;
+    if (binary) {
+        std::fprintf(f, "P6\n%d %d\n255\n", nx, ny);
+        std::vector<unsigned char> row((size_t)nx * 3);
+        for (int j = ny - 1; j >= 0; --j) {
+            for (int i = 0; i < nx; ++i) {
+                const vec3& c = fb[(size_t)j * nx + i];
+                row[i * 3 + 0] = quantise(c.r());
+                row[i * 3 + 1] = quantise(c.g());
+                row[i * 3 + 2] = quantise(c.b());
+            }
+            std::fwrite(row.data(), 1, row.size(), f);
+        }
+    } else {
+        std::fprintf(f, "P3\n%d %d\n255\n", nx, ny);
+        for (int j = ny - 1; j >= 0; --j)
+            for (int i = 0; i < nx; ++i) {
+                const vec3& c = fb[(size_t)j * nx + i];
+                std::fprintf(f, "%d %d %d\n", quantise(c.r()), quantise(c.g()), quantise(c.b()));
+            }
     }
 
-    // frame buffer
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+    const bool ok = std::ferror(f) == 0;
+    if (path) std::fclose(f);
+    else      std::fflush(f);
+    return ok;
+}
 
-    // RNG
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void**)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void**)&d_rand_state2, sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
+// ===========================================================================
+// Driver
+// ===========================================================================
 
-    // scene storage
-    camera   **d_camera; checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
-    const int num_hitables = 4; // ground + gray sphere + light sphere + light quad
-    hittable **d_list;   checkCudaErrors(cudaMalloc((void**)&d_list,   num_hitables * sizeof(hittable*)));
-    hittable **d_world;  checkCudaErrors(cudaMalloc((void**)&d_world,  sizeof(hittable*)));
+static int run_scene(const SceneSpec& spec, const Options& opt)
+{
+    const int nx = opt.width  > 0 ? opt.width  : spec.width;
+    const int ny = opt.height > 0 ? opt.height : spec.height;
+    const int ns = opt.spp    > 0 ? opt.spp    : spec.spp;
 
-    // build the scene on device
-    create_world_simple_light<<<1,1>>>(d_list, d_world, d_camera, nx, ny, ball_img);
+    // The BVH is still built recursively on the device, so each thread needs a
+    // deep stack, and every hittable/material/texture comes from device `new`,
+    // so the malloc heap has to be grown too. Both limits disappear once the
+    // scene is built host-side into flat arrays.
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize,      spec.stack_bytes));
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitMallocHeapSize, spec.heap_bytes));
+
+    // --- textures -----------------------------------------------------------
+    // Loaded once. The old final/original scenes called load_image_to_device
+    // twice on the same path and leaked the first upload every run.
+    DeviceImage tex_a{}, tex_b{};
+    if (spec.texture_a) {
+        tex_a = load_image_to_device(spec.texture_a);
+        if (!tex_a.valid()) { std::fprintf(stderr, "error: failed to load %s\n", spec.texture_a); return 1; }
+    }
+    if (spec.texture_b) {
+        tex_b = load_image_to_device(spec.texture_b);
+        if (!tex_b.valid()) { std::fprintf(stderr, "error: failed to load %s\n", spec.texture_b); free_device_image(tex_a); return 1; }
+    }
+
+    const int    num_pixels = nx * ny;
+    const size_t fb_bytes   = (size_t)num_pixels * sizeof(vec3);
+
+    // --- allocations --------------------------------------------------------
+    vec3        *fb = nullptr, *accum = nullptr;
+    curandState *d_rand_state = nullptr, *d_rand_state2 = nullptr;
+    camera     **d_camera = nullptr;
+    hittable   **d_list = nullptr, **d_world = nullptr;
+    int         *d_count = nullptr;
+
+    checkCudaErrors(cudaMallocManaged((void**)&fb,    fb_bytes));
+    checkCudaErrors(cudaMalloc((void**)&accum,        fb_bytes));
+    checkCudaErrors(cudaMalloc((void**)&d_rand_state,  (size_t)num_pixels * sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void**)&d_rand_state2, sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void**)&d_camera,      sizeof(camera*)));
+    checkCudaErrors(cudaMalloc((void**)&d_world,       sizeof(hittable*)));
+    checkCudaErrors(cudaMalloc((void**)&d_list,        (size_t)spec.capacity * sizeof(hittable*)));
+    checkCudaErrors(cudaMallocManaged((void**)&d_count, sizeof(int)));
+
+    // Zeroing matters: free_world walks d_list and calls delete on each slot.
+    // Any slot the builder did not write would otherwise be a garbage pointer.
+    checkCudaErrors(cudaMemset(d_list, 0, (size_t)spec.capacity * sizeof(hittable*)));
+    *d_count = 0;
+
+    const dim3 blocks((nx + opt.tx - 1) / opt.tx, (ny + opt.ty - 1) / opt.ty);
+    const dim3 threads(opt.tx, opt.ty);
+
+    // --- build --------------------------------------------------------------
+    // cudaEvent measures GPU time directly; the old clock() call measured host
+    // CPU time and has ~10-15 ms resolution on Windows.
+    cudaEvent_t ev_build0, ev_build1, ev_render0, ev_render1;
+    checkCudaErrors(cudaEventCreate(&ev_build0));  checkCudaErrors(cudaEventCreate(&ev_build1));
+    checkCudaErrors(cudaEventCreate(&ev_render0)); checkCudaErrors(cudaEventCreate(&ev_render1));
+
+    checkCudaErrors(cudaEventRecord(ev_build0));
+    rand_init<<<1,1>>>(d_rand_state2, opt.seed);
     checkCudaErrors(cudaGetLastError());
+    launch_scene_builder(spec, d_list, d_world, d_camera, nx, ny, d_rand_state2, tex_a, tex_b, d_count);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaEventRecord(ev_build1));
     checkCudaErrors(cudaDeviceSynchronize());
 
-    // render
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);              checkCudaErrors(cudaDeviceSynchronize());
-    render     <<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state,
-                                     /*background*/ vec3(0,0,0), /*use_gradient_bg*/ 0);
-    checkCudaErrors(cudaDeviceSynchronize());
+    const int built = *d_count;
+    if (built > spec.capacity) {
+        // Already too late to be safe, but far better than failing silently:
+        // this is exactly the condition that was corrupting the heap before.
+        std::fprintf(stderr, "FATAL: scene '%s' wrote %d objects into %d slots\n",
+                     spec.name, built, spec.capacity);
+        return 2;
+    }
+    if (!opt.quiet)
+        std::fprintf(stderr, "scene '%s': %d objects, %dx%d, %d spp, depth %d\n",
+                     spec.name, built, nx, ny, ns, opt.max_depth);
 
-    // output PPM
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) {
-        for (int i = 0; i < nx; ++i) {
-            const size_t k = j*nx + i;
-            int ir = int(255.99f*fb[k].r());
-            int ig = int(255.99f*fb[k].g());
-            int ib = int(255.99f*fb[k].b());
-            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+    // --- render -------------------------------------------------------------
+    checkCudaErrors(cudaEventRecord(ev_render0));
+    clear_buffer<<<(num_pixels + 255) / 256, 256>>>(accum, num_pixels);
+    render_init<<<blocks, threads>>>(nx, ny, d_rand_state, opt.seed);
+    checkCudaErrors(cudaGetLastError());
+
+    // Issue the sample budget in batches. Mathematically identical to one long
+    // launch -- the RNG stream is carried across launches in d_rand_state -- but
+    // each launch stays short enough to survive the Windows display watchdog,
+    // and it gives us a progress indicator for free.
+    const int batch = (opt.batch > 0 && opt.batch < ns) ? opt.batch : ns;
+    for (int done = 0; done < ns; done += batch) {
+        const int n = (done + batch <= ns) ? batch : (ns - done);
+        render_accumulate<<<blocks, threads>>>(accum, nx, ny, n, opt.max_depth,
+                                               d_camera, d_world, d_rand_state,
+                                               spec.background, spec.gradient_bg);
+        checkCudaErrors(cudaGetLastError());
+        if (!opt.quiet) {
+            checkCudaErrors(cudaDeviceSynchronize());
+            std::fprintf(stderr, "\r  %d/%d samples (%.0f%%)   ",
+                         done + n, ns, 100.0 * (done + n) / ns);
+        }
+    }
+    resolve<<<blocks, threads>>>(fb, accum, nx, ny, ns, opt.gamma);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaEventRecord(ev_render1));
+    checkCudaErrors(cudaDeviceSynchronize());
+    if (!opt.quiet) std::fprintf(stderr, "\n");
+
+    float build_ms = 0.0f, render_ms = 0.0f;
+    checkCudaErrors(cudaEventElapsedTime(&build_ms,  ev_build0,  ev_build1));
+    checkCudaErrors(cudaEventElapsedTime(&render_ms, ev_render0, ev_render1));
+
+    if (!opt.quiet)
+        std::fprintf(stderr, "build %.1f ms, render %.3f s (%.2f Mpaths/s)\n",
+                     build_ms, render_ms / 1000.0,
+                     ((double)num_pixels * ns) / (render_ms * 1000.0));
+
+    // --- output -------------------------------------------------------------
+    const bool wrote = write_ppm(opt.out.empty() ? nullptr : opt.out.c_str(),
+                                 opt.binary, fb, nx, ny);
+    if (!wrote) std::fprintf(stderr, "error: failed writing image\n");
+
+    if (!opt.stats.empty()) {
+        std::FILE* sf = std::fopen(opt.stats.c_str(), "w");
+        if (sf) {
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, 0);
+            std::fprintf(sf,
+                "{\n"
+                "  \"backend\": \"cuda\",\n"
+                "  \"device\": \"%s\",\n"
+                "  \"scene\": \"%s\",\n"
+                "  \"width\": %d,\n"
+                "  \"height\": %d,\n"
+                "  \"spp\": %d,\n"
+                "  \"max_depth\": %d,\n"
+                "  \"seed\": %llu,\n"
+                "  \"objects\": %d,\n"
+                "  \"block\": [%d, %d],\n"
+                "  \"batch\": %d,\n"
+                "  \"build_ms\": %.4f,\n"
+                "  \"render_ms\": %.4f,\n"
+                "  \"primary_rays\": %lld\n"
+                "}\n",
+                prop.name, spec.name, nx, ny, ns, opt.max_depth, opt.seed, built,
+                opt.tx, opt.ty, batch, build_ms, render_ms,
+                (long long)num_pixels * ns);
+            std::fclose(sf);
+        } else {
+            std::fprintf(stderr, "warning: cannot write stats to '%s'\n", opt.stats.c_str());
         }
     }
 
-    // --- Clean up ---
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
+    // --- teardown -----------------------------------------------------------
+    // `built`, not `capacity`: deleting past the last initialised slot was
+    // walking uninitialised device memory in the final/original scenes.
+    free_world<<<1,1>>>(d_list, built, d_world, d_camera);
     checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
+    checkCudaErrors(cudaDeviceSynchronize());
 
-    checkCudaErrors(cudaFree(d_camera));
-    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaEventDestroy(ev_build0));  checkCudaErrors(cudaEventDestroy(ev_build1));
+    checkCudaErrors(cudaEventDestroy(ev_render0)); checkCudaErrors(cudaEventDestroy(ev_render1));
+
+    checkCudaErrors(cudaFree(d_count));
     checkCudaErrors(cudaFree(d_list));
-    checkCudaErrors(cudaFree(d_rand_state));
-    checkCudaErrors(cudaFree(fb));
-    cudaDeviceReset();
-    return 0;
-}
-
-int cornell_box() 
-{
-    int nx = 600, ny = 600, ns = 10000;
-    float gamma = 2.2f;
-    int tx = 8, ty = 8;
-
-    cudaDeviceSetLimit(cudaLimitStackSize,      16384);
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
-
-    int num_pixels = nx * ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
-
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void**)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void**)&d_rand_state2, sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    camera **d_camera; checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
-    const int num_hitables = 6; // the 6 Cornell quads shown
-    hittable **d_list;  checkCudaErrors(cudaMalloc((void**)&d_list,  num_hitables * sizeof(hittable*)));
-    hittable **d_world; checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hittable*)));
-
-    create_world_cornell<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);              checkCudaErrors(cudaDeviceSynchronize());
-    render     <<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state,
-                                     /*background*/ vec3(0,0,0), /*use_gradient_bg*/ 0);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; --j) for (int i = 0; i < nx; ++i) {
-        size_t k = j*nx + i;
-        int ir = int(255.99f*fb[k].r());
-        int ig = int(255.99f*fb[k].g());
-        int ib = int(255.99f*fb[k].b());
-        std::cout << ir << ' ' << ig << ' ' << ib << '\n';
-    }
-
-    // --- Clean up ---
-    checkCudaErrors(cudaDeviceSynchronize());                 // make sure render finished
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);   // NOTE: count is 2nd arg
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());                 // wait for device-side deletes
-
-    checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
-    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_rand_state2));   // was leaked by seven of ten scenes
     checkCudaErrors(cudaFree(d_rand_state));
+    checkCudaErrors(cudaFree(accum));
     checkCudaErrors(cudaFree(fb));
-    cudaDeviceReset();
-    return 0;
+    free_device_image(tex_a);
+    free_device_image(tex_b);                   // was leaked by the original scene
+
+    return wrote ? 0 : 1;
 }
 
-void cornell_smoke() {
-    int nx=600, ny=600, ns=1000; float gamma=2.2f; int tx=8, ty=8;
-
-    cudaDeviceSetLimit(cudaLimitStackSize,      65536);           // was 16384
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);   // was 64 MB
-
-    // Framebuffer + RNGs
-    int num_pixels = nx*ny;
-    size_t fb_size = num_pixels * sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    // Scene allocations
-    camera **d_camera; checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    // 5 walls + light + 2 media = 8 objects
-    int num_hitables = 8;
-    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables * sizeof(hittable *)));
-    checkCudaErrors(cudaMemset(d_list, 0, num_hitables * sizeof(hittable*)));
-    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-
-    create_world_cornell_smoke<<<1,1>>>(d_list, d_world, d_camera, nx, ny);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 0);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // Output PPM to stdout (matches your other scenes)
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny - 1; j >= 0; --j) {
-        for (int i = 0; i < nx; ++i) {
-            const size_t k = j * nx + i;
-            int ir = int(255.99f * fb[k].r());
-            int ig = int(255.99f * fb[k].g());
-            int ib = int(255.99f * fb[k].b());
-            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
-        }
-    }
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);
-    checkCudaErrors(cudaDeviceSynchronize());
-    cudaFree(d_rand_state); cudaFree(d_rand_state2); cudaFree(fb);
-    cudaFree(d_list); cudaFree(d_world); cudaFree(d_camera);
-    cudaDeviceReset();
-}
-
-void final_scene() {
-    int nx=800, ny=800, ns=10000; float gamma=2.2f; int tx=8, ty=8;
-
-    cudaDeviceSetLimit(cudaLimitStackSize,      32768);          // 32 KB
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);  // 256 MB
-
-    // Load earth texture to device (same as your earth() scene)
-    unsigned char* d_pixels = nullptr;
-    DeviceImage earth_img = load_image_to_device("textures/earthmap.jpg", &d_pixels);
-    earth_img = load_image_to_device("textures/earthmap.jpg", &d_pixels);
-    if (!earth_img.valid()) { std::cerr << "Failed to load earthmap.jpg\n"; return; }
-
-    // Framebuffer + RNGs
-    int num_pixels = nx*ny; size_t fb_size = num_pixels*sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    // Scene allocations (upper bound ~ 1600 leaves)
-    int num_hitables = 1800;
-    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables*sizeof(hittable *)));
-    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-    camera   **d_camera;checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-
-    create_world_final<<<1,1>>>(d_list, d_world, d_camera, nx, ny, earth_img);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0,0,0), 0);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // Output PPM to stdout (matches your other scenes)
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny - 1; j >= 0; --j) {
-        for (int i = 0; i < nx; ++i) {
-            const size_t k = j * nx + i;
-            int ir = int(255.99f * fb[k].r());
-            int ig = int(255.99f * fb[k].g());
-            int ib = int(255.99f * fb[k].b());
-            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
-        }
-    }
-
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    cudaFree(d_rand_state); 
-    cudaFree(d_rand_state2); 
-    cudaFree(fb);
-    cudaFree(d_list); 
-    cudaFree(d_world); 
-    cudaFree(d_camera);
-
-    // Free device pixels for the earth texture (same as earth())
-    free_device_image(earth_img);
-
-    cudaDeviceReset();
-}
-
-void original_scene() 
+int main(int argc, char** argv)
 {
-    int nx=800, ny=800, ns=10000; float gamma=2.2f; int tx=8, ty=8;
+    Options opt;
+    if (!parse_args(argc, argv, &opt)) return 1;
 
-    cudaDeviceSetLimit(cudaLimitStackSize,      32768);          // 32 KB
-    cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024);  // 256 MB
-
-    // Load textures to device (same as your earth() scene)
-    unsigned char* d_pixels = nullptr;
-    DeviceImage earth_img = load_image_to_device("textures/porcelain.jpg", &d_pixels);
-    earth_img = load_image_to_device("textures/porcelain.jpg", &d_pixels);
-    if (!earth_img.valid()) { std::cerr << "Failed to load porcelain.jpg\n"; return; }
-
-    // Load textures to device (same as your earth() scene)
-    d_pixels = nullptr;
-    DeviceImage ball_img = load_image_to_device("textures/8ball.jpg", &d_pixels);
-    ball_img = load_image_to_device("textures/8ball.jpg", &d_pixels);
-    if (!ball_img.valid()) { std::cerr << "Failed to load 8ball.jpg\n"; return; }
-
-    // Framebuffer + RNGs
-    int num_pixels = nx*ny; size_t fb_size = num_pixels*sizeof(vec3);
-    vec3 *fb; checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
-    curandState *d_rand_state;  checkCudaErrors(cudaMalloc((void **)&d_rand_state,  num_pixels*sizeof(curandState)));
-    curandState *d_rand_state2; checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
-
-    // Scene allocations (upper bound ~ 1600 leaves)
-    int num_hitables = 1800;
-    hittable **d_list;  checkCudaErrors(cudaMalloc((void **)&d_list,  num_hitables*sizeof(hittable *)));
-    hittable **d_world; checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hittable *)));
-    camera   **d_camera;checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-
-    create_world_original<<<1,1>>>(d_list, d_world, d_camera, nx, ny, earth_img, ball_img);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    dim3 blocks(nx/tx+1, ny/ty+1), threads(tx,ty);
-    render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
-    render<<<blocks, threads>>>(fb, nx, ny, ns, gamma, d_camera, d_world, d_rand_state, vec3(0.043f, 0.030f, 0.094f), 0);
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // Output PPM to stdout (matches your other scenes)
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny - 1; j >= 0; --j) {
-        for (int i = 0; i < nx; ++i) {
-            const size_t k = j * nx + i;
-            int ir = int(255.99f * fb[k].r());
-            int ig = int(255.99f * fb[k].g());
-            int ib = int(255.99f * fb[k].b());
-            std::cout << ir << ' ' << ig << ' ' << ib << '\n';
+    if (opt.list) {
+        std::printf("%-16s %9s %7s  %s\n", "scene", "size", "spp", "textures");
+        for (int i = 0; i < SCENE_COUNT; ++i) {
+            const SceneSpec& s = kScenes[i];
+            std::printf("%-16s %4dx%-4d %7d  %s%s%s\n", s.name, s.width, s.height, s.spp,
+                        s.texture_a ? s.texture_a : "-",
+                        s.texture_b ? ", " : "", s.texture_b ? s.texture_b : "");
         }
+        return 0;
     }
 
-    free_world<<<1,1>>>(d_list, num_hitables, d_world, d_camera);
-    checkCudaErrors(cudaDeviceSynchronize());
+    const int rc = run_scene(kScenes[opt.scene], opt);
 
-    cudaFree(d_rand_state); 
-    cudaFree(d_rand_state2); 
-    cudaFree(fb);
-    cudaFree(d_list); 
-    cudaFree(d_world); 
-    cudaFree(d_camera);
-
-    // Free device pixels for the earth texture (same as earth())
-    free_device_image(earth_img);
-
+    // cudaDeviceReset makes leak checking under compute-sanitizer meaningful:
+    // it forces the driver to report anything still allocated at exit.
     cudaDeviceReset();
-}
-
-int main() 
-{
-    switch (10) 
-    {
-        case 1: bouncing_spheres();
-        case 2: checkered_spheres();
-        case 3: earth();
-        case 4: perlin();
-        case 5: quads_scene();
-        case 6: simple_light();
-        case 7: cornell_box();
-        case 8: cornell_smoke();  break;
-        case 9: final_scene();    break;
-        case 10: original_scene();
-    }
+    return rc;
 }
